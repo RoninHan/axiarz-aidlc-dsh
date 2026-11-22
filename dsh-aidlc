@@ -1,0 +1,59 @@
+#!/bin/sh
+# dsh-aidlc — manage the AI-DLC skill for DeepSeek Harness (macOS / Linux / WSL).
+# Usage: dsh-aidlc <init|update|remove|status|help>
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$SCRIPT_DIR/skills/aidlc"
+ROOT="${DSH_HOME:-$HOME/.dsh}/skills"
+DEST="$ROOT/aidlc"
+
+usage() {
+  cat <<'EOF'
+dsh-aidlc — manage the AI-DLC skill for DeepSeek Harness
+
+Usage: dsh-aidlc <command>
+
+Commands:
+  init      Install (or reinstall) the aidlc skill to the user skill root.
+  update    Alias of init.
+  remove    Remove the aidlc skill.
+  status    Show the skill root and whether the skill is installed.
+  help      Show this help.
+EOF
+}
+
+case "${1:-help}" in
+  init|update)
+    if [ ! -f "$SRC/SKILL.md" ]; then
+      echo "Skill source not found at $SRC" >&2
+      exit 1
+    fi
+    mkdir -p "$ROOT"
+    rm -rf "$DEST"
+    cp -R "$SRC" "$DEST"
+    echo "Installed aidlc skill to $DEST"
+    echo 'Done. Start a new DSH session (or refresh) and "aidlc" will appear in the skill catalog.'
+    ;;
+  remove)
+    if [ -d "$DEST" ]; then
+      rm -rf "$DEST"
+      echo "Removed $DEST"
+    else
+      echo "Not installed at $DEST"
+    fi
+    ;;
+  status)
+    echo "Skill root : $ROOT"
+    echo "Install dir: $DEST"
+    if [ -f "$DEST/SKILL.md" ]; then echo "Installed  : yes"; else echo "Installed  : no"; fi
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage
+    exit 1
+    ;;
+esac
