@@ -4974,6 +4974,31 @@ export async function collectDoctorReport(
     // bash or edit map; the person's ask or deny is gone here, said once.
     const shortForm = openCodeGlobalShortFormNote();
     if (shortForm) results.push({ pass: true, severity: "warn", label: shortForm });
+  } else if (harness === ".dsh") {
+    // DSH registers no hook or settings wiring file. Its surfaces are the
+    // conductor skill (DSH discovers .dsh/skills/*/SKILL.md), the engine
+    // dispatcher, and the root AGENTS.md guidance.
+    for (const [file, what] of [
+      ["skills/aidlc/SKILL.md", "conductor skill (DSH discovers .dsh/skills/*/SKILL.md)"],
+      ["tools/aidlc.ts", "engine dispatcher"],
+    ] as const) {
+      results.push({
+        pass: existsSync(join(projectDir, harness, file)),
+        label: `${file} present (${what})`,
+        fix: projectedFileRepair("dsh", `.dsh/${file}`),
+      });
+    }
+    results.push({
+      pass: existsSync(join(projectDir, "AGENTS.md")),
+      label: "AGENTS.md present (always-on workspace guidance)",
+      fix: `restore AGENTS.md at the project root (\`${aidlcInvocation()} config --harness dsh\`)`,
+    });
+    results.push({
+      pass: true,
+      severity: "warn",
+      label:
+        "hooks: this harness registers none (approval gates and plan approval are prose-enforced, not hook-enforced)",
+    });
   } else {
     const settingsPath = join(projectDir, harness, "settings.json");
     results.push({

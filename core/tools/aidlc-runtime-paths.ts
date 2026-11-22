@@ -129,7 +129,7 @@ export interface ProjectHarness {
   frameworkVersion?: string;
 }
 
-const HARNESS_PRECEDENCE = [".claude", ".kiro", ".codex", ".cursor", ".aidlc"] as const;
+const HARNESS_PRECEDENCE = [".claude", ".kiro", ".codex", ".cursor", ".aidlc", ".dsh"] as const;
 
 function markerRecord(path: string): Record<string, unknown> {
   let value: unknown;
