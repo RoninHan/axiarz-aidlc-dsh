@@ -161,6 +161,8 @@ export function providerMenuCopy(
       return { bedrock: "record the manual Copilot BYOK provider setup" };
     case "cursor":
       return { bedrock: "record the manual Cursor provider setup" };
+    case "dsh":
+      return { bedrock: "record the manual DeepSeek Harness provider setup" };
   }
 }
 export type ProviderPendingStatus = "pending" | "done";
@@ -583,6 +585,7 @@ export function readConfigDiagnosticRecords(harnessRoot: string): ConfigDiagnost
     distribution !== "codex" &&
     distribution !== "copilot" &&
     distribution !== "cursor" &&
+    distribution !== "dsh" &&
     distribution !== "kiro" &&
     distribution !== "kiro-ide" &&
     distribution !== "opencode"
@@ -923,6 +926,11 @@ const HARNESS_CLI: Record<
     command: "cursor",
     required: false,
     install: "Install the Cursor CLI and ensure `cursor --version` works; IDE-only installs may omit it.",
+  },
+  dsh: {
+    command: "dsh",
+    required: false,
+    install: "Install DeepSeek Harness and ensure `dsh --version` works; GUI-only installs may omit it.",
   },
   // The 2.x line is where the hooks, skills and workspace default agent this
   // distribution relies on shipped; the guide asks for 2.6 or later.

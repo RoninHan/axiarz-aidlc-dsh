@@ -984,6 +984,7 @@ const HOST_LABELS: Readonly<Record<string, string>> = {
   codex: "Codex CLI",
   copilot: "GitHub Copilot",
   cursor: "Cursor",
+  dsh: "DeepSeek Harness",
   kiro: "Kiro CLI",
   "kiro-ide": "Kiro",
   opencode: "opencode",

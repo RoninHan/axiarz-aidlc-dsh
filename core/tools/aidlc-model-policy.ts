@@ -45,6 +45,7 @@ export type ModelHarness =
   | "codex"
   | "copilot"
   | "cursor"
+  | "dsh"
   | "kiro"
   | "kiro-ide"
   | "opencode";
@@ -161,6 +162,13 @@ export const HARNESS_HONESTY = Object.freeze({
     message:
       "Cursor runs every agent on the model you choose in its model picker, so a model or effort set here is kept for other tools and changes nothing in Cursor.",
   }),
+  dsh: Object.freeze({
+    model: false,
+    effort: false,
+    groupEffort: false,
+    message:
+      "DeepSeek Harness runs every agent on the model route you choose (or a subagent's own route), so a model or effort set here is kept for other tools and changes nothing in DeepSeek Harness.",
+  }),
   copilot: Object.freeze({
     model: false,
     effort: false,
@@ -199,7 +207,7 @@ export function presetsChangeNothing(harness: ModelHarness): boolean {
 // this, so they never disagree on where a change lands.
 export function modelPolicyAgentsDir(harness: ModelHarness, harnessDir: string): string | null {
   if (harness === "opencode") return ".opencode/agents";
-  if (harness === "claude" || harness === "codex" || harness === "kiro" || harness === "kiro-ide") {
+  if (harness === "claude" || harness === "codex" || harness === "dsh" || harness === "kiro" || harness === "kiro-ide") {
     return `${harnessDir}/agents`;
   }
   return null;
@@ -213,6 +221,7 @@ export const HARNESS_PRODUCT_NAMES: Readonly<Record<ModelHarness, string>> = Obj
   codex: "Codex CLI",
   copilot: "GitHub Copilot",
   cursor: "Cursor",
+  dsh: "DeepSeek Harness",
   kiro: "Kiro CLI",
   "kiro-ide": "Kiro",
   opencode: "opencode",
@@ -434,7 +443,9 @@ export function profileGroups(
 }
 
 function tierHarness(harness: ModelHarness): TierHarness {
-  return harness === "kiro-ide" ? "kiro" : harness;
+  if (harness === "kiro-ide") return "kiro";
+  if (harness === "dsh") return "copilot";
+  return harness;
 }
 
 function projectedEffort(value: ReturnType<typeof projectTier>): ModelEffort | undefined {
