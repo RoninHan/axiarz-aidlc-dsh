@@ -37,6 +37,7 @@ type HarnessCapabilities = {
     | "codex-engine"
     | "copilot-agents-md"
     | "cursor-rule"
+    | "dsh-agents-md"
     | "kiro-resources"
     | "kiro-steering"
     | "opencode-instructions";
@@ -132,6 +133,27 @@ const HARNESS_CAPABILITIES = {
     kiroAgentJson: false,
     ideAgentTools: false,
     reviewerScopeRegistration: "cursor-hooks",
+  },
+  dsh: {
+    harnessDir: ".dsh",
+    onboarding: {
+      mode: "manifest",
+      fills: "onboarding.fills.ts",
+      dist: "AGENTS.md",
+      harnessDist: ".dsh/onboarding.md",
+    },
+    rootFiles: ["AGENTS.md"],
+    skillsRoot: ".dsh/skills",
+    plugin: {
+      kind: "store",
+      manifestDir: ".dsh-plugin",
+      marketplaceDir: ".dsh-plugin",
+      wiringFile: null,
+    },
+    memoryInclude: "dsh-agents-md",
+    kiroAgentJson: false,
+    ideAgentTools: false,
+    reviewerScopeRegistration: "unsupported",
   },
   "kiro-ide": {
     harnessDir: ".kiro",
@@ -305,7 +327,11 @@ function validateManifest(
         manifest.harnessDir === ".aidlc" &&
         manifest.skipRunnerGen === true) ||
     (capabilities.memoryInclude === "cursor-rule") !==
-      manifest.harnessFiles.some((file) => file.dst === "rules/aidlc.mdc")
+      manifest.harnessFiles.some((file) => file.dst === "rules/aidlc.mdc") ||
+    (capabilities.memoryInclude === "dsh-agents-md") !==
+      (manifest.onboarding?.projectRoot === true &&
+        manifest.onboarding.dst === "AGENTS.md" &&
+        manifest.harnessDir === ".dsh")
   ) {
     fail(name, "memoryInclude does not agree with manifest-owned include surfaces");
   }
