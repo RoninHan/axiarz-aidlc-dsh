@@ -18,6 +18,7 @@ export const BINDING_HEADINGS: Readonly<Record<string, string>> = {
   "kiro-ide": "Kiro IDE",
   codex: "Codex CLI",
   cursor: "Cursor",
+  dsh: "DeepSeek Harness",
   opencode: "opencode",
   copilot: "GitHub Copilot",
 };

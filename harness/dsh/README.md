@@ -33,13 +33,20 @@ the conductor skill (`.dsh/skills/aidlc/SKILL.md`), the engine dispatcher
 (`.dsh/tools/aidlc.ts`), and the root `AGENTS.md`, and states the hooks gap as
 one advisory warning. Verified end to end on a simulated install.
 
+## Tool binding
+
+`scripts/harness-bindings.ts` names `dsh: "DeepSeek Harness"`, and each of the
+four binding runs (ensemble, construction, reviewer, swarm) ships a
+`### DeepSeek Harness` subsection (the `subagent`-tool shape, cloned from the
+Kiro CLI subsection). The packager's `keepOwnHarnessBindings` then ships only
+that subsection in a dsh tree, so the agent reads DSH's own dispatch wording
+instead of every tool's.
+
 ## Known gaps (M1)
 
-- **Tool binding** — `scripts/harness-bindings.ts` has no `dsh` heading, so a
-  dsh tree ships every tool's protocol subsection in the four binding runs
-  (ensemble, construction, reviewer, swarm) until a `### DeepSeek Harness`
-  subsection is added to each and `BINDING_HEADINGS` gains `dsh`.
-- **Hook adapter** — none authored (see the hook gap above).
+- **Hook adapter** — none authored (see the hook gap above). The four binding
+  runs now ship a `### DeepSeek Harness` subsection (see `Tool binding` below);
+  only the hook adapter and the DSH-side hook wiring remain.
 
 ## Tier projection
 
