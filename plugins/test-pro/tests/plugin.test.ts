@@ -1,0 +1,175 @@
+// The test-pro plugin's own content validation.
+//
+// Distinct from the framework compose guard: this checks the plugin's authored
+// content, and its doctor check in a composed install. It is this repository's
+// shape: it imports tests/harness/plugin-kit.ts and the dist/ trees by relative
+// path, so it runs only inside this checkout. A plugin in its own repository
+// runs the shipped verbs in CI instead, from a native install: `aidlc plugin
+// validate`, `aidlc plugin test --install <project>` and `aidlc plugin build
+// <harness>` (docs/harness-engineering/10-authoring-a-plugin.md, "In your
+// plugin's repository").
+//
+// Run: bun test plugins/test-pro/tests/plugin.test.ts
+
+import {
+  NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../../../tests/harness/test-budget.ts";
+import { afterAll, beforeAll, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  validatePluginContent,
+  walkMarkdownFiles,
+} from "../../../tests/harness/plugin-kit.ts";
+
+setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = join(HERE, "..");
+const REPO_ROOT = join(PLUGIN_ROOT, "..", "..");
+const CLAUDE_DIST = join(REPO_ROOT, "dist", "claude", ".claude");
+const MEMORY_DIST = join(REPO_ROOT, "dist", "claude", "aidlc");
+const PLUGIN_DIST = join(REPO_ROOT, "dist", "plugins", "test-pro", "claude");
+const PLUGIN_NAME = "test-pro";
+
+describe("test-pro plugin own content validation", () => {
+  test("passes the reusable plugin content validator", () => {
+    expect(validatePluginContent(PLUGIN_ROOT)).toEqual([]);
+  });
+
+  test("ships stages and contributions", () => {
+    expect(walkMarkdownFiles(join(PLUGIN_ROOT, "stages")).length).toBeGreaterThan(0);
+    expect(
+      walkMarkdownFiles(join(PLUGIN_ROOT, "contributions")).length,
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe(`${PLUGIN_NAME} plugin — sensor tools honor the main(argv) contract`, () => {
+  const SENSOR_TOOLS = [
+    "aidlc-sensor-coverage-threshold.ts",
+    "aidlc-sensor-requirement-coverage.ts",
+  ];
+
+  for (const tool of SENSOR_TOOLS) {
+    const toolPath = join(PLUGIN_ROOT, "tools", tool);
+
+    test(`${tool} exports main(argv) and does not run on import under engine argv`, () => {
+      const probe = [
+        `const mod = await import(${JSON.stringify(toolPath)});`,
+        `if (typeof mod.main !== "function") { console.error("no-main"); process.exit(3); }`,
+        `console.log("imported");`,
+      ].join("\n");
+      const result = spawnSync(
+        process.execPath,
+        ["-e", probe, "engine", "--stage", "code-generation"],
+        {
+          timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+          encoding: "utf-8",
+        },
+      );
+      expect(result.status, `${result.stdout ?? ""}${result.stderr ?? ""}`).toBe(0);
+      expect(result.stdout).toContain("imported");
+      expect(result.stdout).not.toContain('"pass"');
+    });
+
+    test(`${tool} parses the argv it is handed, not process.argv`, () => {
+      const probe = [
+        `const mod = await import(${JSON.stringify(toolPath)});`,
+        `mod.main(["--stage", "code-generation", "--output-path", "/nonexistent/other.json"]);`,
+      ].join("\n");
+      const result = spawnSync(
+        process.execPath,
+        ["-e", probe, "engine", "--unknown-engine-flag"],
+        {
+          timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+          encoding: "utf-8",
+        },
+      );
+      expect(result.status, `${result.stdout ?? ""}${result.stderr ?? ""}`).toBe(0);
+      expect(result.stdout).toContain('"pass":true');
+      expect(result.stderr).not.toContain("--output-path is required");
+    });
+  }
+});
+
+describe(`${PLUGIN_NAME} plugin — composed doctor check`, () => {
+  let tmp = "";
+  let project = "";
+
+  beforeAll(() => {
+    tmp = mkdtempSync(join(tmpdir(), "aidlc-test-pro-doctor-"));
+    project = join(tmp, "project");
+    mkdirSync(project, { recursive: true });
+    cpSync(CLAUDE_DIST, join(project, ".claude"), { recursive: true });
+    cpSync(MEMORY_DIST, join(project, "aidlc"), { recursive: true });
+    const compose = spawnSync(process.execPath, [join(PLUGIN_DIST, "hooks", "compose.ts")], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      cwd: project,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: PLUGIN_DIST,
+        CLAUDE_PROJECT_DIR: project,
+        AIDLC_HARNESS_DIR: ".claude",
+      },
+    });
+    if (compose.status !== 0) {
+      throw new Error(`test-pro compose failed: ${compose.stderr ?? compose.stdout}`);
+    }
+  });
+
+  afterAll(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("doctor surfaces the plugin's reference checks after compose", () => {
+    const doctor = spawnSync(
+      process.execPath,
+      [join(project, ".claude", "tools", "aidlc-utility.ts"), "doctor", "--verbose", "--project-dir", project],
+      {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        cwd: project,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: project,
+          AIDLC_HARNESS_DIR: ".claude",
+          AIDLC_PLUGIN_DOCTOR_TIMEOUT_MS: String(remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS)),
+        },
+      },
+    );
+    expect(doctor.status, `${doctor.stdout ?? ""}${doctor.stderr ?? ""}`).toBe(0);
+    expect(doctor.stdout).toContain("Plugin check (test-pro):");
+  });
+
+  // A contribution's step lands among the target stage's own work, before its
+  // Completion Handoff: after it, the agent hands the stage over for approval
+  // before writing what the contribution asks for.
+  test("every test-pro step lands before its target stage's Completion Handoff", () => {
+    const stagesDir = join(project, ".claude", "aidlc-common", "stages");
+    const composed = walkMarkdownFiles(stagesDir).filter((file) => readFileSync(file, "utf-8").includes("(test-pro):"));
+    expect(composed.length).toBeGreaterThan(0);
+    const late: string[] = [];
+    for (const file of composed) {
+      const text = readFileSync(file, "utf-8").replace(/\r\n/g, "\n");
+      const handoff = text.search(/^### Step \d+: Completion Handoff\b/m);
+      expect(handoff, file).toBeGreaterThan(-1);
+      for (const step of text.matchAll(/^### Step[^\n]*\(test-pro\):[^\n]*$/gm)) {
+        if ((step.index ?? 0) > handoff) late.push(`${file.slice(stagesDir.length + 1)}: ${step[0]}`);
+      }
+    }
+    expect(late).toEqual([]);
+  });
+});

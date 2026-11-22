@@ -1,0 +1,367 @@
+// covers: subcommand:aidlc-orchestrate:next, subcommand:aidlc-utility:scope-change, subcommand:aidlc-utility:intent-create, audit:SCOPE_CHANGED
+//
+// t214 - the scope-cost preview reaches the emitted routing strings (issue:
+// preview the cost at scope confirmation). t213 pins the helper; this pins the
+// STRINGS the user actually sees. Every expected number is computed inside the
+// test from the shipped scope-grid.json + stage-graph.json - never a literal -
+// so the assertions track the grid.
+//
+// Surfaces:
+//   - the keyword-hit confirm (Branch 8) carries "N stages, G approval gates"
+//     for the MATCHED scope (N: the stages after Initialization),
+//   - the compose offer carries the express/classic/feature example trio,
+//     computed from the grid, and still avoids the t198 `"feature" workflow` trap,
+//   - the explicit-scope creation print carries the cost parenthetical,
+//   - intent create's "State initialized" line says that print's count, for
+//     every shipped scope on a new project and on existing code, and
+//   - scope-change stdout carries the "Approval gates:" line (greenfield
+//     reverse-engineering adjustment applied, matching the handler), and the
+//     SCOPE_CHANGED row says the same stages and gates.
+//
+// Mechanism: CLI spawn of the shipped dist engine (t198's convention) - no LLM,
+// unit tier.
+
+import {
+  NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterEach, beforeAll, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  AIDLC_SRC,
+  cleanupTestProject,
+  createTestProject,
+  FIXTURES_DIR,
+  proposalFollowUp,
+  removeWorkspaceRecord,
+  resetAidlcEnv,
+  seededStateFile,
+  seedStateFile,
+} from "../harness/fixtures.ts";
+import { auditEvents, field } from "../harness/scope-run.ts";
+
+setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+const BUN = process.execPath;
+const ORCH = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
+const UTIL = join(AIDLC_SRC, "tools", "aidlc-utility.ts");
+const MID_IDEATION = join(FIXTURES_DIR, "state-mid-ideation.md");
+
+const GRID = require("../../dist/claude/.claude/tools/data/scope-grid.json") as Record<
+  string,
+  { stages: Record<string, "EXECUTE" | "SKIP"> }
+>;
+const GRAPH = require("../../dist/claude/.claude/tools/data/stage-graph.json") as Array<{
+  slug: string;
+  phase: string;
+  for_each?: string;
+}>;
+const PHASE = new Map(GRAPH.map((s) => [s.slug, s.phase]));
+const PER_UNIT = new Set(
+  GRAPH.filter((s) => s.for_each === "unit-of-work").map((s) => s.slug),
+);
+
+// Independent derivation (mirrors gridCostSummary), applying the optional
+// greenfield reverse-engineering adjustment so the scope-change expectation
+// matches the handler's effective grid.
+function counts(
+  stages: Record<string, "EXECUTE" | "SKIP">,
+  greenfieldAdjust = false,
+): { execute: number; total: number; gates: number; shown: number; perUnitStages: number } {
+  const st = { ...stages };
+  if (greenfieldAdjust && st["reverse-engineering"] === "EXECUTE") {
+    st["reverse-engineering"] = "SKIP";
+  }
+  const total = Object.keys(st).length;
+  const hasUnitDag = st["units-generation"] === "EXECUTE";
+  let execute = 0;
+  let gates = 0;
+  let shown = 0;
+  let perUnitStages = 0;
+  for (const [slug, action] of Object.entries(st)) {
+    if (action !== "EXECUTE") continue;
+    execute++;
+    if (PHASE.get(slug) !== "initialization") {
+      gates++;
+      shown++;
+    }
+    if (hasUnitDag && PER_UNIT.has(slug)) perUnitStages++;
+  }
+  return { execute, total, gates, shown, perUnitStages };
+}
+
+function costClause(cost: ReturnType<typeof counts>): string {
+  const perUnit = cost.perUnitStages > 0
+    ? `, ${cost.perUnitStages} ${cost.perUnitStages === 1 ? "stage repeats" : "stages repeat"} per unit of work in Construction`
+    : "";
+  // The stages after Initialization: the count the progress line uses too.
+  return `${cost.shown} stages, ${cost.gates} approval gates${perUnit}`;
+}
+
+interface RunResult {
+  rc: number;
+  out: string;
+}
+
+function runNext(proj: string, args: string[], env: Record<string, string> = {}): RunResult {
+  // Ahead of the person's words, as every caller of `next` builds it.
+  const res = spawnSync(BUN, [ORCH, "next", "--project-dir", proj, ...args], {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    encoding: "utf-8",
+    cwd: proj,
+    env: {
+      ...process.env,
+      AIDLC_DISABLE_SENSORS: "0",
+      AIDLC_DISABLE_LEARNINGS: "0",
+      AIDLC_DISABLE_SUMMARY_CONFIRMATION: "0",
+      ...env,
+    },
+  });
+  // The agent's proposal step follows the plan proposal print, as it does live.
+  let directive: unknown = null;
+  try { directive = JSON.parse((res.stdout ?? "").trim()); } catch { /* the caller reads the raw output */ }
+  const proposal = proposalFollowUp(directive);
+  return proposal === null ? { rc: res.status ?? -1, out: `${res.stdout ?? ""}${res.stderr ?? ""}` } : runNext(proj, proposal, env);
+}
+
+function runUtility(proj: string, args: string[]): RunResult {
+  const res = spawnSync(BUN, [UTIL, ...args, "--project-dir", proj], {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    encoding: "utf-8",
+    cwd: proj,
+  });
+  return { rc: res.status ?? -1, out: `${res.stdout ?? ""}${res.stderr ?? ""}` };
+}
+
+function directiveOf(out: string): Record<string, unknown> {
+  const line = out.split("\n").find((l) => l.trim().startsWith("{"));
+  expect(line).toBeDefined();
+  return JSON.parse(line as string) as Record<string, unknown>;
+}
+
+let proj = "";
+beforeAll(() => {
+  resetAidlcEnv();
+});
+afterEach(() => {
+  resetAidlcEnv();
+  cleanupTestProject(proj);
+  proj = "";
+});
+
+describe("t214 keyword-hit confirm carries the effective cost clause", () => {
+  test("greenfield bugfix confirm adjusts reverse engineering and omits per-unit fan-out", () => {
+    proj = createTestProject();
+    const d = directiveOf(runNext(proj, ["fix login bug"]).out);
+    expect(d.kind).toBe("ask");
+    const q = String(d.question);
+    expect(q).toContain('"bugfix"');
+    const bf = counts(GRID.bugfix.stages, true);
+    // The plan's size and nothing after it: the settings are the plan's, and --status shows them.
+    expect(q).toContain(`- ${costClause(bf)}. Do you want me to go ahead`);
+    expect(q).not.toContain("per unit of work");
+  });
+
+  test("brownfield bugfix confirm keeps nominal reverse-engineering counts", () => {
+    proj = createTestProject();
+    writeFileSync(join(proj, "app.ts"), "export const existing = true;\n");
+    const d = directiveOf(runNext(proj, ["fix login bug"]).out);
+    expect(d.kind).toBe("ask");
+    const q = String(d.question);
+    expect(q).toContain(costClause(counts(GRID.bugfix.stages)));
+    expect(q).not.toContain("per unit of work");
+  });
+});
+
+describe("t214 compose offer carries the example counts (no feature-workflow trap)", () => {
+  test("offer names bugfix/express/classic/feature counts and avoids the t198 pinned substring", () => {
+    proj = createTestProject();
+    const d = directiveOf(
+      runNext(proj, ["build a distributed cache layer with consistency guarantees"]).out,
+    );
+    expect(d.kind).toBe("ask");
+    const q = String(d.question);
+    expect(q).toContain("compose");
+    const bugfix = counts(GRID.bugfix.stages, true);
+    const express = counts(GRID.express.stages, true);
+    const classic = counts(GRID.classic.stages, true);
+    const feature = counts(GRID.feature.stages, true);
+    // bugfix leads, so a bug the description gave no word for is still offered.
+    expect(q).toContain(
+      `e.g. bugfix = ${bugfix.shown} stages, express = ${express.shown}`,
+    );
+    expect(q).toContain(`classic = ${classic.shown}`);
+    expect(q).toContain(`feature = ${feature.shown}`);
+    expect(q).not.toContain("of 33");
+    // t198's "rich prose (no clear hit) -> the compose offer, never a silent
+    // default" test pins this substring's absence on the compose-offer arm.
+    expect(q).not.toContain('"feature" workflow');
+  });
+});
+
+describe("t214 every plan the offer lists carries the engine's own count", () => {
+  // A host that shows the other plans as choices shows these numbers, so the
+  // choices agree with the question ("classic = 17" in the question, "18 of 33
+  // stages" on the classic choice was the agent's own count).
+  function rowsAgree(d: Record<string, unknown>, greenfield: boolean): void {
+    const rows = d.scope_commands as Array<{ scope: string; stages?: string }>;
+    for (const [scope, entry] of Object.entries(GRID)) {
+      const c = counts(entry.stages, greenfield);
+      expect(rows.find((row) => row.scope === scope)?.stages, scope).toBe(`${c.shown} ${c.shown === 1 ? "stage" : "stages"}`);
+    }
+  }
+
+  test("the compose offer's plans, on a new project", () => {
+    proj = createTestProject();
+    const d = directiveOf(runNext(proj, ["build a distributed cache layer with consistency guarantees"]).out);
+    expect(d.ask_type).toBe("compose-offer");
+    rowsAgree(d, true);
+    expect(String(d.question)).toContain(`classic = ${counts(GRID.classic.stages, true).shown}`);
+    // Every count the question names is its plan's row count, so a choice that
+    // shows a row's number can only differ from the question in wording.
+    const rows = d.scope_commands as Array<{ scope: string; stages?: string }>;
+    const named = [...String(d.question).matchAll(/\b([a-z][a-z-]*) = (\d+)\b/g)];
+    expect(named.map(([, scope]) => scope)).toEqual(["bugfix", "express", "classic", "feature"]);
+    for (const [, scope, n] of named) {
+      expect(rows.find((row) => row.scope === scope)?.stages, scope).toBe(`${n} stages`);
+    }
+  });
+
+  test("the plan offer's other plans, on existing code", () => {
+    proj = createTestProject();
+    writeFileSync(join(proj, "app.ts"), "export const existing = true;\n");
+    const d = directiveOf(runNext(proj, ["fix login bug"]).out);
+    expect(d.ask_type).toBe("scope-confirm");
+    rowsAgree(d, false);
+    expect(String(d.question)).toContain(costClause(counts(GRID.bugfix.stages)));
+  });
+});
+
+describe("t214 creation print carries the cost parenthetical", () => {
+  test("next bugfix prints intent-create AND the computed cost", () => {
+    proj = createTestProject();
+    // A genuinely empty workspace creates instead of prompting to pick (t198's
+    // "known-scope positional with a description still creates (Branch 7b)" test).
+    // The plan with a description creates; named alone it first asks (#2355).
+    removeWorkspaceRecord(proj);
+    const d = directiveOf(runNext(proj, ["bugfix", "Fix the login crash"]).out);
+    expect(d.kind).toBe("print");
+    const m = String(d.message);
+    expect(m).toContain("intent create --scope bugfix");
+    const bf = counts(GRID.bugfix.stages, true);
+    expect(m).toContain(`(${costClause(bf)})`);
+    expect(m).not.toContain("per unit of work");
+  });
+
+  test("a setting typed with the request rides the command; the preview says the plan's size only", () => {
+    proj = createTestProject();
+    removeWorkspaceRecord(proj);
+    const result = runNext(proj, [
+      "--scope", "classic", "--summary-confirmation", "on", "add login support",
+    ]);
+    expect(result.rc, result.out).toBe(0);
+    const d = directiveOf(result.out);
+    expect(d.kind).toBe("print");
+    const message = String(d.message);
+    expect(message).toContain("--summary-confirmation on");
+    expect(message).toContain(`(${costClause(counts(GRID.classic.stages, true))})`);
+  });
+
+  test("a machine switch is not said in the creation preview (the person set it; --status shows it)", () => {
+    proj = createTestProject();
+    removeWorkspaceRecord(proj);
+    const result = runNext(proj, ["--scope", "feature", "--sensors", "on", "add login support"], {
+      AIDLC_DISABLE_SENSORS: "1",
+    });
+    expect(result.rc, result.out).toBe(0);
+    const d = directiveOf(result.out);
+    expect(d.kind).toBe("print");
+    expect(String(d.message)).toContain(`(${costClause(counts(GRID.feature.stages, true))})`);
+    expect(String(d.message)).not.toContain("; no ");
+  });
+
+  for (const scope of ["classic", "feature"]) {
+    test(`next ${scope} retains the derived per-unit clause`, () => {
+      proj = createTestProject();
+      removeWorkspaceRecord(proj);
+      const d = directiveOf(runNext(proj, [scope, "add login support"]).out);
+      expect(d.kind).toBe("print");
+      const expected = counts(GRID[scope].stages, true);
+      expect(expected.perUnitStages).toBeGreaterThan(0);
+      expect(String(d.message)).toContain(`(${costClause(expected)})`);
+      expect(String(d.message)).toContain("per unit of work");
+    });
+  }
+});
+
+describe("t214 scope-change stdout carries the stage and gate counts", () => {
+  // feature to mvp on the mid-ideation record, as the engine writes it: the
+  // Stage Progress note the switch rewrites the stages under, and a new
+  // project's plan with no Reverse Engineering.
+  function switchToMvp(): RunResult {
+    proj = createTestProject();
+    seedStateFile(proj, MID_IDEATION);
+    const file = seededStateFile(proj);
+    writeFileSync(file, readFileSync(file, "utf-8")
+      .replace("## Stage Progress\n", "## Stage Progress\n<!-- Checkbox states: [ ] not started -->\n")
+      .replace("- [ ] reverse-engineering \u2014 EXECUTE", "- [ ] reverse-engineering \u2014 SKIP"));
+    return runUtility(proj, ["scope-change", "--scope", "mvp"]);
+  }
+
+  test("scope change --scope mvp says its stages and approval gates in one line", () => {
+    const r = switchToMvp();
+    expect(r.rc).toBe(0);
+    // The fixture is Greenfield, so reverse-engineering EXECUTE -> SKIP. Market
+    // Research, done before the switch, still counts, as the progress line counts it.
+    const mvp = counts(GRID.mvp.stages, true);
+    expect(r.out).toContain(
+      `Switched to mvp (the set of stages this work runs): ${mvp.shown + 1} stages (2 done), ` +
+        `${mvp.gates + 1} approval gates. You can switch back to feature any time.`,
+    );
+  });
+
+  test("the SCOPE_CHANGED row counts the stages and gates the line says", () => {
+    const r = switchToMvp();
+    expect(r.rc).toBe(0);
+    const said = /: (\d+) stages \(\d+ done\), (\d+) approval gates\./.exec(r.out);
+    expect(said, r.out).not.toBeNull();
+    const rows = auditEvents(proj).filter((e) => e.event === "SCOPE_CHANGED");
+    expect(rows).toHaveLength(1);
+    expect(field(rows[0].block, "Stages in Scope")).toBe(said![1]);
+    expect(field(rows[0].block, "Approval Gates")).toBe(said![2]);
+    // The change from the count the person read before: feature's stages on
+    // this record, Reverse Engineering off.
+    const before = counts(GRID.feature.stages, true).shown;
+    const delta = Number(said![1]) - before;
+    expect(field(rows[0].block, "Stage Count Delta")).toBe(delta >= 0 ? `+${delta}` : String(delta));
+  });
+});
+
+describe("t214 the creation line says the count the creation print said", () => {
+  // The offer, the creation print and each stage's "(stage N of M)" count the
+  // stages after Initialization; the line `intent create` prints says that same
+  // number, not Initialization's three stages on top.
+  for (const scope of Object.keys(GRID)) {
+    for (const code of [false, true]) {
+      test(`${scope}, ${code ? "existing code" : "a new project"}`, () => {
+        proj = createTestProject();
+        removeWorkspaceRecord(proj);
+        if (code) writeFileSync(join(proj, "app.ts"), "export const existing = true;\n");
+        const d = directiveOf(runNext(proj, ["--scope", scope, "add login support"]).out);
+        expect(d.kind).toBe("print");
+        const message = String(d.message);
+        const shown = counts(GRID[scope].stages, !code).shown;
+        expect(message).toContain(`(${shown} stages, `);
+        const request = /--request (\S+)/.exec(message)?.[1];
+        const created = runUtility(proj, [
+          "intent-create", "--scope", scope, ...(request ? ["--request", request] : []), "--label", "count check",
+        ]);
+        expect(created.rc, created.out).toBe(0);
+        expect(created.out).toContain(`State initialized: ${scope} scope, ${shown} stages,`);
+      });
+    }
+  }
+});

@@ -1,0 +1,957 @@
+// The person-turn check every live drive runs: a decision recorded as the
+// person's needs a turn the driver sent after its gate or question opened.
+// Seeded audit rows stand in for the engine's, so each case is exact.
+import { afterEach, describe, expect, test } from "bun:test";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
+import { cleanupTestProject, createTestProject, seedBoltDag, seededAuditShard } from "../harness/fixtures.ts";
+import {
+  expectPersonFirst,
+  nextPersonTurnCarriesPicks,
+  PersonTurnError,
+  PersonTurnLedger,
+  startPersonTurnSession,
+  submittedToPersonTurnSession,
+  typedIntoPersonTurnSession,
+  unbackedFailure,
+  unbackedTuiDecisions,
+} from "../harness/person-turns.ts";
+import { menuPick, reviewedPicks } from "../harness/tui-drive.ts";
+import { saveMessage } from "../../dist/claude/.claude/tools/aidlc-message-store.ts";
+
+const projects: string[] = [];
+const folders: string[] = [];
+afterEach(() => {
+  for (const project of projects.splice(0)) cleanupTestProject(project);
+  for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true });
+  delete process.env.AIDLC_PERSON_TURNS_DIR;
+});
+
+/** A private ledger folder for this case, as the driver makes its own. */
+function ledgerFolder(): string {
+  const folder = mkdtempSync(join(tmpdir(), "t-person-turns-ledger-"));
+  folders.push(folder);
+  process.env.AIDLC_PERSON_TURNS_DIR = folder;
+  return folder;
+}
+
+let clock = 0;
+function row(project: string, event: string, fields: Record<string, string> = {}, shard = seededAuditShard(project)): void {
+  mkdirSync(dirname(shard), { recursive: true });
+  const at = new Date(Date.UTC(2026, 9, 4, 12, 0, clock++)).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const lines = Object.entries(fields).map(([name, value]) => `**${name}**: ${value}`);
+  appendFileSync(shard, [`## ${event}`, `**Timestamp**: ${at}`, `**Event**: ${event}`, ...lines, "", "---", "", ""].join("\n"));
+}
+
+function project(): string {
+  const dir = createTestProject();
+  projects.push(dir);
+  row(dir, "WORKFLOW_STARTED");
+  return dir;
+}
+
+// The human-turn hook keeps the person's message `text` (their `words` past an
+// AIDLC entry) and names it on its turn row; returns the message's id. The
+// store drops records older than a day as it saves one, so the message keeps
+// the time it is saved at.
+function kept(dir: string, text: string, words = text, chat = "chat-a"): string {
+  const message = saveMessage(dir, {
+    session: chat, at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), source: "prompt", text, picker: null, words,
+    settings: [], route: { scope: null, newIntent: false, skip: [], add: [], projectType: null },
+  });
+  row(dir, "HUMAN_TURN", { Session: chat, Origin: "person", Source: "typed", "Message Id": message.id });
+  return message.id;
+}
+
+// The runner never retries a file that fails with this error (tests/lib/file-retry.ts),
+// so every person-turn failure must be one: the drives' unbacked-decision failure and
+// a test's own "the person came first" check alike.
+describe("person-turn failures carry their own error", () => {
+  test("an unbacked decision fails as a PersonTurnError", () => {
+    const failure = unbackedFailure("The SDK drive", ["GATE_APPROVED at 00:00"]);
+    expect(failure).toBeInstanceOf(PersonTurnError);
+    expect(failure.name).toBe("PersonTurnError");
+  });
+
+  test("expectPersonFirst passes when the person came first, and fails as a PersonTurnError when not", () => {
+    expect(() => expectPersonFirst(true, "work was started before the person answered")).not.toThrow();
+    let thrown: unknown;
+    try {
+      expectPersonFirst(false, "work was started before the person answered");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PersonTurnError);
+    expect((thrown as Error).message).toBe("work was started before the person answered");
+  });
+});
+
+describe("person-turn check", () => {
+  test("an approval the agent recorded with no turn after the gate opened is flagged", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc --scope mvp");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+    row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "approve" });
+    const [problem, ...rest] = drive.unbacked();
+    expect(rest).toEqual([]);
+    expect(problem).toContain("GATE_APPROVED team-formation");
+    expect(problem).toContain('recorded words "approve"');
+  });
+
+  test("an approval after the person answered the open gate passes", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc --scope mvp");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+    drive.sent('{"Approve the team?":"Approve"}');
+    row(dir, "HUMAN_TURN");
+    row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "Approve" });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  // The check reads a turn as the human-turn hook does: words alone after the
+  // AIDLC entry are a reply that backs the approval; a flag keeps it a command.
+  test("\"/aidlc approve\" backs an approval; \"/aidlc --status\" does not", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+    drive.sent("/aidlc --status");
+    row(dir, "HUMAN_TURN", { Reply: "command" });
+    row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "Approve" });
+    expect(drive.unbacked()).toHaveLength(1);
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories" });
+    drive.sent("/aidlc approve");
+    row(dir, "HUMAN_TURN");
+    row(dir, "GATE_APPROVED", { Stage: "user-stories", "User Input": "Approve" });
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  test("a gate opened before the drive is backed by the drive's opening prompt", () => {
+    const dir = project();
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "requirements-analysis" });
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("Approve");
+    row(dir, "GATE_APPROVED", { Stage: "requirements-analysis", "User Input": "Approve" });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  // "Choose the recommended answers", said in the opening command before the
+  // questions came: the agent's answers name that message, and its turn backs them.
+  test("a choice the person left to the agent is backed by the turn that sent the message it names", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    const opening = "/aidlc build the lunch poll, and choose the  Recommended answers for the questions";
+    drive.sent(opening);
+    const id = kept(dir, opening, "build the lunch poll, and choose the  Recommended answers for the questions");
+    row(dir, "DECISION_RECORDED", { Stage: "intent-capture" });
+    row(dir, "QUESTION_ANSWERED", {
+      Stage: "intent-capture", Details: "Q1: A; Q2: B",
+      "Answer Source": "chosen by the agent, reading their message", "Message Id": id,
+    });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  test("a choice marked as left to the agent naming no message, or one the person never sent, is flagged", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc build the lunch poll");
+    row(dir, "DECISION_RECORDED", { Stage: "intent-capture" });
+    row(dir, "QUESTION_ANSWERED", {
+      Stage: "intent-capture", Details: "Q1: A",
+      "Answer Source": "chosen by the agent, reading their message", "Conductor Summary": "up to you",
+    });
+    row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis" });
+    row(dir, "QUESTION_ANSWERED", {
+      Stage: "requirements-analysis", Details: "Q1: B",
+      "Answer Source": "chosen by the agent, reading their message", "Message Id": kept(dir, "up to you"),
+    });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(2);
+    expect(problems[0]).toContain("QUESTION_ANSWERED intent-capture");
+    expect(problems[1]).toContain("QUESTION_ANSWERED requirements-analysis");
+  });
+
+  test("an answer needs a turn after its question opened; another stage's turn does not count", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis" });
+    drive.sent("an answer to the requirements question");
+    row(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis" });
+    row(dir, "DECISION_RECORDED", { Stage: "user-stories" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "user-stories", Details: "picked by the agent" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("QUESTION_ANSWERED user-stories");
+    expect(problems[0]).toContain('recorded words "picked by the agent"');
+  });
+
+  test("a row in a shard that began during the drive is backed only by the turn sent just before it began, or a later one", () => {
+    // A fresh clone writes a shard of its own; this one's name sorts first, so it is read first.
+    const dir = project();
+    const clone = join(dirname(seededAuditShard(dir)), "aaaa-000000000000.md");
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc --scope classic build it");
+    row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis" });
+    drive.sent("Guide me", 1);
+    row(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Guide me" });
+    drive.sent("Approve Plan");
+    row(dir, "PLAN_APPROVAL_RECORDED", { Stage: "code-generation", Details: "Approve Plan" }, clone);
+    expect(drive.unbacked()).toEqual([]);
+    // A second one with no turn since has nothing behind it.
+    row(dir, "PLAN_APPROVAL_RECORDED", { Stage: "code-generation", Details: "Approve Plan" }, clone);
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  test("a project type the agent changed with no turn after the work started is flagged", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("add a rate limiter");
+    row(dir, "WORKSPACE_INITIALISED", { "Project Type": "Greenfield" });
+    row(dir, "WORKSPACE_RECLASSIFIED", { "New Project Type": "Greenfield (you)" });
+    expect(drive.unbacked()[0]).toContain("WORKSPACE_RECLASSIFIED");
+    expect(drive.unbacked()[0]).toContain('recorded words "Greenfield (you)"');
+    drive.sent("it is a new project");
+    row(dir, "WORKSPACE_RECLASSIFIED", { "New Project Type": "Brownfield (you)" });
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  // The rows of the 2026-10-16 nightly's compose-front run: the person's only words came in the first chat; the
+  // second chat's "Approve" created the work as a new project, and the agent changed it to existing code naming the
+  // message those words came in.
+  test("a project type changed on the person's message is backed by the turn that sent it, from an earlier chat too", () => {
+    const words = "harden the deployment pipeline and add observability for our existing service - no new features, compose a custom plan for exactly this";
+    const opening = `Use the $aidlc skill to run: /aidlc compose "${words}"`;
+    // `named`: the text of the message the change names, kept as the hook keeps it.
+    const beat = (earlier: string[], named?: string) => {
+      const dir = createTestProject();
+      projects.push(dir);
+      const drive = new PersonTurnLedger(dir, earlier);
+      drive.sent("Approve");
+      row(dir, "WORKFLOW_STARTED");
+      row(dir, "WORKSPACE_INITIALISED", { "Project Type": "Greenfield", "Project Type Source": "scan" });
+      const id = named === undefined ? undefined : kept(dir, named);
+      row(dir, "WORKSPACE_RECLASSIFIED", {
+        "Old Project Type": "Greenfield (scan)", "New Project Type": "Brownfield (you)", ...(id === undefined ? {} : { "Message Id": id }),
+      });
+      return drive.unbacked();
+    };
+    expect(beat([opening], opening)).toEqual([]);
+    // The run's own failure stays for a change that names no message, a message the driver never sent, or a turn not in the work.
+    const failure = 'recorded words "Brownfield (you)": no reply from the person after it opened; the driver sent 1 turn(s): "Approve"';
+    for (const problems of [beat([opening]), beat([opening], "it is an existing service"), beat([], opening)]) {
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toStartWith("WORKSPACE_RECLASSIFIED at ");
+      expect(problems[0]).toEndWith(failure);
+    }
+  });
+
+  test("decisions written before the drive started are not this drive's", () => {
+    const dir = project();
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "intent-capture" });
+    row(dir, "GATE_APPROVED", { Stage: "intent-capture" });
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("carry on");
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  test.skipIf(process.platform === "win32")("the TUI ledger refuses a folder another account could write", () => {
+    const folder = ledgerFolder();
+    chmodSync(folder, 0o777);
+    expect(() => startPersonTurnSession("t-person-turns-hostile", project())).toThrow("is not a private folder");
+  });
+
+  test("a slash command at an open gate is no reply to it, but backs what it asks for", () => {
+    const dir = project();
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "requirements-analysis" });
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc --scope mvp");
+    row(dir, "GATE_APPROVED", { Stage: "requirements-analysis", "User Input": "Approve" });
+    row(dir, "WORKSPACE_RECLASSIFIED", { "New Project Type": "Brownfield (you)" });
+    row(dir, "GATE_REJECTED", { Stage: "code-generation", Unit: "alpha", Feedback: "jump" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("GATE_APPROVED requirements-analysis");
+  });
+
+  test("one entry answers a question the person answered once; a second answer needs a newer turn", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis", Decision: "Q1-Q3: scale, auth, region" });
+    drive.sent('{"scale":"small","auth":"Cognito","region":"us-east-1"}');
+    row(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: small; Q2: Cognito; Q3: us-east-1" });
+    expect(drive.unbacked()).toEqual([]);
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "plan-approval" });
+    drive.sent("rename the handler first");
+    row(dir, "QUESTION_ANSWERED", { Stage: "code-generation", Checkpoint: "plan-approval", Details: "Request Changes" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "code-generation", Checkpoint: "plan-approval", Details: "Approve Plan" });
+    expect(drive.unbacked()).toHaveLength(1);
+    expect(drive.unbacked()[0]).toContain("QUESTION_ANSWERED code-generation");
+    drive.sent("now approve it");
+    row(dir, "QUESTION_ANSWERED", { Stage: "code-generation", Checkpoint: "plan-approval", Details: "Approve Plan" });
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  test("one menu submission backs as many answers as it carried picks, and no more", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    // One menu asks two questions; the person picks on both and submits once.
+    row(dir, "DECISION_RECORDED", { Stage: "intent-capture", Decision: "Anything to add for next time?" });
+    drive.sent('{"Keep this note?":"Keep (project)","Anything to add for next time?":"Nothing to add"}', 2);
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Keep (project)" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Nothing to add" });
+    expect(drive.unbacked()).toEqual([]);
+    // A third answer has no pick behind it.
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Add a note" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Add a note"');
+  });
+
+  test("a typed reply backs one answer per question open when it arrived", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis", Decision: "Q1-Q2: scale, auth" });
+    drive.sent("small, and Cognito");
+    row(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: small" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q2: Cognito" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Q2: Cognito"');
+  });
+
+  test("one typed reply answers every question open when it arrived; a question asked after it waits", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    for (const question of ["Way of working?", "Walking skeleton?", "How much testing?"]) {
+      row(dir, "DECISION_RECORDED", { Stage: "practices-discovery", Decision: question });
+    }
+    drive.sent("A, B, and A with CI");
+    for (const reply of ["A", "B", "A, with CI"]) {
+      row(dir, "QUESTION_ANSWERED", { Stage: "practices-discovery", Details: reply });
+    }
+    expect(drive.unbacked()).toEqual([]);
+    row(dir, "DECISION_RECORDED", { Stage: "practices-discovery", Decision: "Deploy anywhere?" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "practices-discovery", Details: "Deploy to staging" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Deploy to staging"');
+  });
+
+  // The rows one answer to "Approve these 2 code plans?" writes, as the engine writes them: one per plan, back to back.
+  const GROUPED = { Stage: "code-generation", Checkpoint: "plan-approval", Session: "01995000-7a11-7000-8000-00000000d001" };
+  test("one typed reply to a grouped code plan question backs every plan in it, approved or sent back; a later group needs a newer turn", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc");
+    drive.sent("1");
+    for (const unit of ["alpha", "beta"]) row(dir, "PLAN_APPROVAL_RECORDED", { ...GROUPED, Unit: unit, Details: "Approve Plan" });
+    expect(drive.unbacked()).toEqual([]);
+    row(dir, "UNIT_COMPLETED", { Stage: "code-generation", Unit: "alpha" });
+    drive.sent("2");
+    for (const unit of ["gamma", "delta"]) row(dir, "QUESTION_ANSWERED", { ...GROUPED, Unit: unit, Details: "Request Changes" });
+    expect(drive.unbacked()).toEqual([]);
+    row(dir, "UNIT_COMPLETED", { Stage: "code-generation", Unit: "gamma" });
+    for (const unit of ["epsilon", "zeta"]) row(dir, "PLAN_APPROVAL_RECORDED", { ...GROUPED, Unit: unit, Details: "Approve Plan" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("PLAN_APPROVAL_RECORDED code-generation (Unit epsilon)");
+  });
+
+  test("approvals back to back that are not one grouped answer each need a turn", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc");
+    drive.sent("approve alpha");
+    // Another chat's approval, a different choice, and a checkpoint that is not the plan question are separate answers.
+    row(dir, "PLAN_APPROVAL_RECORDED", { ...GROUPED, Unit: "alpha", Details: "Approve Plan" });
+    row(dir, "PLAN_APPROVAL_RECORDED", { ...GROUPED, Session: "01995000-7a11-7000-8000-00000000e002", Unit: "beta", Details: "Approve Plan" });
+    row(dir, "QUESTION_ANSWERED", { ...GROUPED, Unit: "gamma", Details: "Request Changes" });
+    row(dir, "QUESTION_ANSWERED", { ...GROUPED, Unit: "delta", Details: "Approve Plan" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "code-generation", Checkpoint: "verification-command", Session: GROUPED.Session, Unit: "alpha", Details: "Approve" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "code-generation", Checkpoint: "verification-command", Session: GROUPED.Session, Unit: "beta", Details: "Approve" });
+    expect(drive.unbacked().map((problem) => /\(Unit (\w+)\)/.exec(problem)?.[1])).toEqual(["beta", "gamma", "delta", "alpha", "beta"]);
+  });
+
+  test("a later question supersedes an earlier one, as the engine pairs them", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "DECISION_RECORDED", { Stage: "build-and-test", Checkpoint: "plan-approval" });
+    drive.sent("approve the plan");
+    // A second question opened after the reply is the one an answer now closes.
+    row(dir, "DECISION_RECORDED", { Stage: "build-and-test", Checkpoint: "summary-confirmation" });
+    row(dir, "SUMMARY_CONFIRMATION_RECORDED", { Stage: "build-and-test", Details: "Looks correct" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("SUMMARY_CONFIRMATION_RECORDED build-and-test");
+  });
+
+  test("a menu answer backs the question the agent logs after it, until the next decision", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "DECISION_RECORDED", { Stage: "nfr-requirements", Decision: "How would you like to answer the questions?" });
+    drive.sent('{"How would you like to answer them?":"Guide me"}', 1);
+    row(dir, "QUESTION_ANSWERED", { Stage: "nfr-requirements", Details: "Guide me" });
+    // The person answers the batch in the menu; the agent logs the batch's question after.
+    drive.sent('{"Source language?":"TypeScript","File layout?":"Two files"}', 2);
+    row(dir, "DECISION_RECORDED", { Stage: "nfr-requirements", Decision: "Q1-Q2: source language, file layout" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "nfr-requirements", Details: "Q1=A; Q2=A" });
+    expect(drive.unbacked()).toEqual([]);
+    // A question logged after that answer needs a newer turn, menu or not.
+    row(dir, "DECISION_RECORDED", { Stage: "nfr-requirements", Decision: "Q3: deploy target" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "nfr-requirements", Details: "Q3=A" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Q3=A"');
+  });
+
+  test("a menu answer backs a late-logged question only as many times as it carried picks", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    drive.sent('{"What problem are we solving?":"Personal tasks"}', 1);
+    row(dir, "DECISION_RECORDED", { Stage: "intent-capture", Decision: "Q1: problem" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Q1: A" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Q2: A" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Q2: A"');
+  });
+
+  test("a Unit checkpoint's gate row answers its own question, and needs a reply after it", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("carry on with the build");
+    const question = { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "alpha", Kind: "unit" };
+    row(dir, "DECISION_RECORDED", question);
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "alpha" });
+    expect(drive.unbacked()).toHaveLength(1);
+    row(dir, "DECISION_RECORDED", { ...question, Unit: "beta" });
+    drive.sent('{"Approve Unit beta?":"Approve"}');
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "beta" });
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  test("the rows an approval backfills keep the gate's first opening", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories" });
+    drive.sent('{"Approve the user stories?":"Approve"}');
+    // The approval backfills a revision the agent never reported, then approves.
+    row(dir, "GATE_REJECTED", { Stage: "user-stories", Recovered: "true" });
+    row(dir, "STAGE_REVISING", { Stage: "user-stories", Recovered: "true" });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories", Recovered: "true" });
+    row(dir, "GATE_APPROVED", { Stage: "user-stories", "User Input": "Approve" });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  test("a field on a row never makes it the engine's", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "code-generation" });
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Autonomous: "true" });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "build-and-test" });
+    row(dir, "GATE_APPROVED", { Stage: "build-and-test", Recovered: "true" });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories" });
+    row(dir, "GATE_REJECTED", { Stage: "user-stories", Recovered: "true" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(3);
+    expect(problems[0]).toContain("GATE_APPROVED code-generation");
+    expect(problems[1]).toContain("GATE_APPROVED build-and-test");
+    expect(problems[2]).toContain("GATE_REJECTED user-stories");
+  });
+
+  test("under the person's autonomous grant the engine approves Construction; the walking skeleton still asks", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "units-generation" });
+    drive.sent('{"Approve the units?":"Approve"}');
+    row(dir, "GATE_APPROVED", { Stage: "units-generation", "User Input": "Approve" });
+    drive.sent('{"How should Construction run?":"Autonomous"}');
+    row(dir, "AUTONOMY_MODE_SET", { Mode: "autonomous" });
+    // An ordinary stage gate and a Unit checkpoint, approved with no question.
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "functional-design" });
+    row(dir, "GATE_APPROVED", { Stage: "functional-design" });
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "alpha", Kind: "unit" });
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "alpha", Autonomous: "true" });
+    expect(drive.unbacked()).toEqual([]);
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "beta", Kind: "skeleton" });
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "walking-skeleton", Unit: "beta", Autonomous: "true" });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("GATE_APPROVED code-generation (Unit beta)");
+  });
+
+  test("the autonomous grant needs a turn after the last gate, and a new workflow ends it", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "units-generation" });
+    drive.sent('{"Approve the units?":"Approve"}');
+    row(dir, "GATE_APPROVED", { Stage: "units-generation", "User Input": "Approve" });
+    row(dir, "AUTONOMY_MODE_SET", { Mode: "autonomous" });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "functional-design" });
+    row(dir, "GATE_APPROVED", { Stage: "functional-design" });
+    expect(drive.unbacked()).toHaveLength(1);
+    expect(drive.unbacked()[0]).toContain('AUTONOMY_MODE_SET at');
+    row(dir, "WORKFLOW_STARTED");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "code-generation" });
+    row(dir, "GATE_APPROVED", { Stage: "code-generation" });
+    expect(drive.unbacked()).toHaveLength(2);
+    expect(drive.unbacked()[1]).toContain("GATE_APPROVED code-generation");
+  });
+
+  test("once the person approves a Unit checkpoint, the engine settles the stage gates it covers; a rejected checkpoint takes that back", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    const stages = "functional-design, code-generation";
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "core", Kind: "unit" });
+    drive.sent('{"Approve this completed core?":"Approve"}');
+    row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "core", "Gate Stages": stages });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "functional-design" });
+    row(dir, "GATE_APPROVED", { Stage: "functional-design" });
+    expect(drive.unbacked()).toEqual([]);
+    // A stage no approved checkpoint covers still needs the person.
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "build-and-test" });
+    row(dir, "GATE_APPROVED", { Stage: "build-and-test", "User Input": "Approve" });
+    expect(drive.unbacked()).toHaveLength(1);
+    expect(drive.unbacked()[0]).toContain("GATE_APPROVED build-and-test");
+    // After the person rejects the checkpoint, its stages are theirs to approve again.
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "core", Kind: "unit" });
+    drive.sent('{"Approve this completed core?":"Request Changes"}');
+    row(dir, "GATE_REJECTED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "core", "Gate Stages": stages });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "functional-design" });
+    row(dir, "GATE_APPROVED", { Stage: "functional-design" });
+    expect(drive.unbacked()).toHaveLength(2);
+    expect(drive.unbacked()[1]).toContain("GATE_APPROVED functional-design");
+  });
+
+  test("with two Units the engine settles a stage only after both checkpoints are approved; a rejection, a reopen and a jump count", () => {
+    const dir = project();
+    seedBoltDag(dir, ["core", { name: "extra", depends_on: ["core"] }]);
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    const checkpoint = (unit: string, event: "GATE_APPROVED" | "GATE_REJECTED", reply: string) => {
+      row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: unit, Kind: "unit" });
+      drive.sent(`{"Approve this completed ${unit}?":"${reply}"}`);
+      row(dir, event, { Stage: "code-generation", Checkpoint: "construction-unit", Unit: unit, "Gate Stages": "code-generation" });
+    };
+    const stageGate = () => {
+      row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "code-generation" });
+      row(dir, "GATE_APPROVED", { Stage: "code-generation" });
+    };
+    checkpoint("core", "GATE_APPROVED", "Approve");
+    // The second Unit is not approved yet: a stage approval now is nobody's.
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(1);
+    checkpoint("extra", "GATE_APPROVED", "Approve");
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(1);
+    // The person rejects the second Unit, then approves it again.
+    checkpoint("extra", "GATE_REJECTED", "Request Changes");
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(2);
+    checkpoint("extra", "GATE_APPROVED", "Approve");
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(2);
+    // A reopen names the Unit with no Checkpoint, and a jump moves the work: each takes the approvals back.
+    drive.sent("reopen core, the totals are wrong");
+    row(dir, "GATE_REJECTED", { Stage: "code-generation", Unit: "core", "Gate Stages": "code-generation", Feedback: "the totals are wrong" });
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(3);
+    checkpoint("core", "GATE_APPROVED", "Approve");
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(3);
+    drive.sent("go back to requirements");
+    row(dir, "STAGE_JUMPED", { From: "code-generation", To: "requirements-analysis" });
+    stageGate();
+    expect(drive.unbacked()).toHaveLength(4);
+  });
+
+  // The engine reads every shard of the work for the Units' approvals, so a
+  // person who builds the second Unit in a fresh clone settles the stage there.
+  test("a Unit approved in another clone's shard counts toward the stage the engine settles in this one", () => {
+    const dir = project();
+    seedBoltDag(dir, ["core", { name: "extra", depends_on: ["core"] }]);
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("start");
+    const fresh = join(dirname(seededAuditShard(dir)), "aaaa-fresh-clone.md");
+    const checkpoint = (unit: string, shard: string) => {
+      row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: unit, Kind: "unit" }, shard);
+      drive.sent(`{"Approve this completed ${unit}?":"Approve"}`);
+      row(dir, "GATE_APPROVED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: unit, "Gate Stages": "code-generation" }, shard);
+    };
+    checkpoint("core", seededAuditShard(dir));
+    checkpoint("extra", fresh);
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "code-generation" }, fresh);
+    row(dir, "GATE_APPROVED", { Stage: "code-generation" }, fresh);
+    expect(drive.unbacked()).toEqual([]);
+    // A rejection in that clone takes its Unit's approval back for the other
+    // clone too: a stage approval there is the person's to give again.
+    row(dir, "DECISION_RECORDED", { Stage: "code-generation", Checkpoint: "Construction Unit Approval", Unit: "extra", Kind: "unit" }, fresh);
+    drive.sent('{"Approve this completed extra?":"Request Changes"}');
+    row(dir, "GATE_REJECTED", { Stage: "code-generation", Checkpoint: "construction-unit", Unit: "extra", "Gate Stages": "code-generation" }, fresh);
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "code-generation" });
+    row(dir, "GATE_APPROVED", { Stage: "code-generation" });
+    expect(drive.unbacked()).toHaveLength(1);
+    expect(drive.unbacked()[0]).toContain("GATE_APPROVED code-generation");
+  });
+
+  test("a gate in a single-stage run is not opened by the main workflow's gate", () => {
+    const dir = project();
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories" });
+    const drive = new PersonTurnLedger(dir);
+    drive.sent("/aidlc --single user-stories");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "user-stories", Workflow: "single-stage:user-stories" });
+    row(dir, "GATE_APPROVED", { Stage: "user-stories", Workflow: "single-stage:user-stories" });
+    expect(drive.unbacked()).toHaveLength(1);
+  });
+
+  test("the TUI ledger spans every session of the project and goes when it is read", () => {
+    const folder = ledgerFolder();
+    const dir = project();
+    const session = `t-person-turns-${process.pid}`;
+    startPersonTurnSession(session, dir);
+    submittedToPersonTurnSession(session, "/aidlc --scope mvp");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+    // A restarted session keeps the first session's start and turns.
+    startPersonTurnSession(session, dir);
+    submittedToPersonTurnSession(session, "");
+    row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "Approve" });
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "requirements-analysis" });
+    // A slash command typed, then submitted with Enter, is still a command.
+    typedIntoPersonTurnSession(session, "/aidlc ");
+    typedIntoPersonTurnSession(session, "--status");
+    submittedToPersonTurnSession(session, "");
+    row(dir, "GATE_APPROVED", { Stage: "requirements-analysis", "User Input": "Approve" });
+    submittedToPersonTurnSession("t-person-turns-no-such-session", "");
+    const problems = unbackedTuiDecisions(dir);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("GATE_APPROVED requirements-analysis");
+    expect(problems[0]).toContain('"/aidlc --status"');
+    expect(readdirSync(folder)).toEqual([]);
+    expect(unbackedTuiDecisions(dir)).toEqual([]);
+    expect(unbackedFailure("The TUI drive", problems).message)
+      .toStartWith("The TUI drive recorded 1 decision(s) as the person's that no turn from them backs:\n  GATE_APPROVED");
+  });
+
+  // An unbacked decision fails the drive after the project is removed, so the
+  // run's only record of the order is what the check keeps: the turn ledger
+  // and the project's audit trail, in the test's log folder that CI uploads.
+  test("an unbacked decision keeps the turn ledger and the audit trail in the test's log folder", () => {
+    ledgerFolder();
+    const dir = project();
+    const logs = mkdtempSync(join(tmpdir(), "t-person-turns-logs-"));
+    folders.push(logs);
+    const before = process.env.AIDLC_TEST_LOG_DIR;
+    process.env.AIDLC_TEST_LOG_DIR = logs;
+    try {
+      const session = `t-person-turns-evidence-${process.pid}`;
+      startPersonTurnSession(session, dir);
+      submittedToPersonTurnSession(session, "/aidlc --scope mvp");
+      row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+      row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "Approve" });
+      expect(unbackedTuiDecisions(dir)).toHaveLength(1);
+      const kept = readdirSync(logs).filter((name) => name.startsWith("unbacked-decisions-"));
+      expect(kept).toHaveLength(1);
+      const evidence = join(logs, kept[0]);
+      expect(readFileSync(join(evidence, "turn-ledger.jsonl"), "utf-8")).toContain("/aidlc --scope mvp");
+      const shard = seededAuditShard(dir);
+      const copied = join(evidence, relative(dir, shard));
+      expect(readFileSync(copied, "utf-8")).toBe(readFileSync(shard, "utf-8"));
+    } finally {
+      if (before === undefined) delete process.env.AIDLC_TEST_LOG_DIR;
+      else process.env.AIDLC_TEST_LOG_DIR = before;
+    }
+  });
+
+  test("a TUI form's Submit backs one answer per pick on it; a pick on one of its tabs backs none", () => {
+    const folder = ledgerFolder();
+    const dir = project();
+    const session = `t-person-turns-form-${process.pid}`;
+    startPersonTurnSession(session, dir);
+    submittedToPersonTurnSession(session, "/aidlc --stage intent-capture");
+    row(dir, "DECISION_RECORDED", { Stage: "intent-capture", Decision: "Anything to add for next time?" });
+    // A pick on each of the form's two tabs, then Submit.
+    nextPersonTurnCarriesPicks(session, 0);
+    submittedToPersonTurnSession(session, "");
+    nextPersonTurnCarriesPicks(session, 0);
+    submittedToPersonTurnSession(session, "");
+    nextPersonTurnCarriesPicks(session, 2, "Keep (project); Nothing to add");
+    submittedToPersonTurnSession(session, "");
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Keep (project)" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Nothing to add" });
+    row(dir, "QUESTION_ANSWERED", { Stage: "intent-capture", Details: "Add a note" });
+    const problems = unbackedTuiDecisions(dir);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('recorded words "Add a note"');
+    expect(problems[0]).toContain('"Keep (project); Nothing to add"');
+    expect(readdirSync(folder)).toEqual([]);
+  });
+
+  // Run 38809298225 on Windows: the person picked "Guide me" on a lone
+  // question, and the agent recorded it as a choice left to it, naming the
+  // pick's message. Only a turn the driver read the pick's words off can back
+  // that message.
+  test("a lone menu pick backs an answer the agent records naming its message", () => {
+    const screen = [
+      "─".repeat(60),
+      " ☐ Answer mode",
+      "",
+      "│ I've created 5 questions about how your team wants to work on this project, at",
+      "│ inception/practices-discovery/practices-discovery-questions.md. How would you like to answer them?",
+      "",
+      "❯ 1. Guide me",
+      "     I'll walk you through each question here, one batch at a time.",
+      "  2. I'll edit the file",
+      "     You fill in the answers directly in the questions file, then tell me you're done.",
+      "  3. Chat",
+      "     We discuss freely and I pull the decisions out of the conversation.",
+      "  4. Type something.",
+      "─".repeat(60),
+    ].join("\n");
+    expect(menuPick(screen)).toBe("Guide me");
+    expect(menuPick(screen.replace("❯ 1. Guide me", "❯ 1.─Guide me─────"))).toBe("Guide me");
+    expect(menuPick("│ Which areas apply?\n\n❯ 1. [ ] Storage\n  2. [ ] Network")).toBe("Storage");
+    ledgerFolder();
+    const problems = [menuPick(screen), ""].map((words, which) => {
+      const dir = project();
+      const session = `t-person-turns-lone-pick-${which}-${process.pid}`;
+      startPersonTurnSession(session, dir);
+      submittedToPersonTurnSession(session, "/aidlc --scope classic Build a simple React todo app");
+      row(dir, "DECISION_RECORDED", {
+        Stage: "practices-discovery", Decision: "How would you like to answer the questions?", "Question Kind": "answer-mode",
+      });
+      nextPersonTurnCarriesPicks(session, 1, words);
+      submittedToPersonTurnSession(session, "");
+      const id = kept(dir, "Guide me");
+      row(dir, "QUESTION_ANSWERED", {
+        Stage: "practices-discovery", Details: "Guide me",
+        "Answer Source": "chosen by the agent, reading their message", "Message Id": id,
+      });
+      return unbackedTuiDecisions(dir);
+    });
+    expect(problems[0]).toEqual([]);
+    // A pick the driver read no words off backs no message.
+    expect(problems[1]).toHaveLength(1);
+    expect(problems[1][0]).toContain("QUESTION_ANSWERED practices-discovery");
+    expect(problems[1][0]).toContain('recorded words "Guide me"');
+  });
+
+  // Run 40779000516 on Linux: the person picked "You pick" and "SQLite" on a
+  // two-question form, and the agent recorded both as a choice left to it,
+  // naming the Submit's message. The hook keeps the picks one per line in the
+  // message's words; the driver joins them with "; ".
+  test("a form's picks back an answer the agent records naming its message", () => {
+    ledgerFolder();
+    const problems = ["You pick; SQLite", ""].map((words, which) => {
+      const dir = project();
+      const session = `t-person-turns-form-pick-${which}-${process.pid}`;
+      startPersonTurnSession(session, dir);
+      submittedToPersonTurnSession(session, "/aidlc --scope classic Build a simple task tracker");
+      row(dir, "DECISION_RECORDED", { Stage: "requirements-analysis", Decision: "Q5 tech stack; Q6 storage" });
+      nextPersonTurnCarriesPicks(session, 2, words);
+      submittedToPersonTurnSession(session, "");
+      const id = kept(dir, "You pick", "You pick\nSQLite");
+      row(dir, "QUESTION_ANSWERED", {
+        Stage: "requirements-analysis", Details: "Q5: You pick; Q6: SQLite", "Person Reply": "You pick\\nSQLite",
+        "Answer Source": "chosen by the agent, reading their message", "Message Id": id,
+      });
+      return unbackedTuiDecisions(dir);
+    });
+    expect(problems[0]).toEqual([]);
+    expect(problems[1]).toHaveLength(1);
+    expect(problems[1][0]).toContain("QUESTION_ANSWERED requirements-analysis");
+  });
+
+  test("a form's picks are read off its review screen, or its ticked tabs when the review is out of view", () => {
+    const review = [
+      "────────────────────────────────────────",
+      "←  ☒ Learning  ☒ Add note  ✔ Submit  →",
+      "",
+      "Review your answers",
+      "",
+      " │ ● I jotted one note from this stage. Keep it as a practice for next time?",
+      " │   (a solo-owner personal task tracker)",
+      "   → Keep (project)",
+      " ● Anything to add for next time?",
+      "   → Nothing to add",
+      "",
+      "Ready to submit your answers?",
+      "",
+      "❯ 1. Submit answers",
+      "  2. Cancel",
+    ].join("\n");
+    expect(reviewedPicks(review)).toEqual(["Keep (project)", "Nothing to add"]);
+    // Only the last review counts, up to its own Submit, and never more picks
+    // than the form has tabs.
+    const earlier = ["Review your answers", "   → A", "   → B", "   → C", "", "Ready to submit your answers?"].join("\n");
+    expect(reviewedPicks(`${earlier}\n${review}\n   → Not a pick`)).toEqual(["Keep (project)", "Nothing to add"]);
+    const crowded = review.replace("   → Nothing to add", "   → Nothing to add\n   → An answer the agent wrote");
+    expect(reviewedPicks(crowded)).toEqual(["Keep (project)", "Nothing to add"]);
+    expect(reviewedPicks("←  ☒ Stakeholders  ☒ Comms  ☐ Scope  ✔ Submit  →\n\n❯ 1. Submit answers")).toEqual(["", ""]);
+  });
+
+  test.each([
+    { case: "is removed", tamper: (file: string) => rmSync(file), says: "is gone: the driver sent 2 turn(s) to 1 session(s)" },
+    {
+      case: "loses a turn",
+      tamper: (file: string) => writeFileSync(file, readFileSync(file, "utf-8").split("\n").slice(0, 2).join("\n")),
+      says: "holds 1 of the 2 turn(s) the driver sent",
+    },
+    {
+      case: "loses its start",
+      tamper: (file: string) => writeFileSync(file, readFileSync(file, "utf-8").split("\n").slice(1).join("\n")),
+      says: "holds 2 of the 2 turn(s) the driver sent and no session start",
+    },
+    { case: "is garbled", tamper: (file: string) => appendFileSync(file, "{not json\n"), says: "cannot be read" },
+  ])("a TUI ledger that $case during the drive fails it", ({ tamper, says }) => {
+    const folder = ledgerFolder();
+    const dir = project();
+    const session = `t-person-turns-tamper-${process.pid}`;
+    startPersonTurnSession(session, dir);
+    submittedToPersonTurnSession(session, "/aidlc --scope mvp");
+    row(dir, "STAGE_AWAITING_APPROVAL", { Stage: "team-formation" });
+    submittedToPersonTurnSession(session, "Approve");
+    row(dir, "GATE_APPROVED", { Stage: "team-formation", "User Input": "Approve" });
+    const [ledger] = readdirSync(folder).filter((name) => name.startsWith("ledger-"));
+    tamper(join(folder, ledger));
+    expect(() => unbackedTuiDecisions(dir)).toThrow(says);
+    expect(readdirSync(folder)).toEqual([]);
+  });
+});
+
+// The engine binds an answer to the message the agent names for a question it
+// logged after the reply (proveMessage in aidlc-log.ts); the ledger reads the
+// binding the same way.
+describe("an answer that names the person's message", () => {
+  // The store drops records older than a day as it saves one, so these rows run on a recent clock.
+  const base = Date.now() - 60 * 60_000;
+  let tick = 0;
+  const stamp = () => new Date(base + 1000 * tick++).toISOString().replace(/\.\d{3}Z$/, "Z");
+  function recent(dir: string, event: string, fields: Record<string, string> = {}): void {
+    const shard = seededAuditShard(dir);
+    mkdirSync(dirname(shard), { recursive: true });
+    const lines = Object.entries(fields).map(([name, value]) => `**${name}**: ${value}`);
+    appendFileSync(shard, [`## ${event}`, `**Timestamp**: ${stamp()}`, `**Event**: ${event}`, ...lines, "", "---", "", ""].join("\n"));
+  }
+  // The driver types `words` into `chat`; the human-turn hook keeps the message and writes its turn row.
+  function typed(dir: string, drive: PersonTurnLedger, words: string, chat = "chat-a"): string {
+    drive.sent(words);
+    const message = saveMessage(dir, {
+      session: chat, at: stamp(), source: "prompt", text: words, picker: null, words, settings: [],
+      route: { scope: null, newIntent: false, skip: [], add: [], projectType: null },
+    });
+    recent(dir, "HUMAN_TURN", { Session: chat, Origin: "person", Source: "typed", "Message Id": message.id });
+    return message.id;
+  }
+  const question = (decision: string) => ({ Stage: "requirements-analysis", Decision: decision, Options: "A,B,X" });
+  const REPLY = "Keep it small: the greeting uses the name, and nothing else changes";
+
+  test("a typed reply backs the answer to a question the agent logged after it, when the answer names it", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    recent(dir, "DECISION_RECORDED", question("Q1: no name given"));
+    const id = typed(dir, drive, REPLY);
+    recent(dir, "DECISION_RECORDED", question("Q2: name handling"));
+    recent(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: A; Q2: A", "Message Id": id, "Person Reply": REPLY });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  test("a message from another chat does not back it", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    recent(dir, "DECISION_RECORDED", question("Q1: no name given"));
+    const id = typed(dir, drive, REPLY, "chat-b");
+    typed(dir, drive, "what does Q1 mean?");
+    recent(dir, "DECISION_RECORDED", question("Q2: name handling"));
+    recent(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: A; Q2: A", "Message Id": id });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("QUESTION_ANSWERED requirements-analysis");
+  });
+
+  // Issue #3424: on an SDK drive the person answered four questions in one box,
+  // the agent recorded them naming that message, then read its first answer
+  // ("follow the spec exactly") as leaving two later questions to it. The
+  // driver sends a box answer as its answers object; the hook keeps the
+  // picks one per line in the message's words, and only the first in its text.
+  test("a question box's answers back a later choice left to the agent that names the same message", () => {
+    const picks = ["Follow docs/spec.md exactly", "Treat as no coupon", "message equals code", "Exact match"];
+    // The driver's box answer, then one whose answers are not the message's picks.
+    const problems = [picks, [...picks.slice(0, 3), "Case-insensitive"]].map((sent) => {
+      const dir = project();
+      const drive = new PersonTurnLedger(dir);
+      recent(dir, "DECISION_RECORDED", question("Q1-Q4"));
+      drive.sent(JSON.stringify(Object.fromEntries(sent.map((pick, n) => [`Q${n + 1}?`, pick]))), sent.length);
+      const message = saveMessage(dir, {
+        session: "chat-a", at: stamp(), source: "picker", text: picks[0],
+        picker: picks.map((pick, n) => ({ question: `Q${n + 1}?`, reply: pick })), words: picks.join("\n"), settings: [],
+        route: { scope: null, newIntent: false, skip: [], add: [], projectType: null },
+      });
+      recent(dir, "HUMAN_TURN", { Session: "chat-a", Origin: "person", Source: "picker", "Message Id": message.id });
+      recent(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: picks.join("; "), "Message Id": message.id });
+      recent(dir, "DECISION_RECORDED", question("Q5-Q6"));
+      recent(dir, "QUESTION_ANSWERED", {
+        Stage: "requirements-analysis", Details: "Q5: B; Q6: A",
+        "Answer Source": "chosen by the agent, reading their message", "Message Id": message.id,
+      });
+      return drive.unbacked();
+    });
+    expect(problems[0]).toEqual([]);
+    expect(problems[1]).toHaveLength(1);
+    expect(problems[1][0]).toContain('recorded words "Q5: B; Q6: A"');
+  });
+
+  // A multi-select answer comes from the drive as an array; the hook keeps it
+  // as its picks joined with ", ", and leaves a blank answer out.
+  test("a question box's multi-select answer backs a later choice left to the agent", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    recent(dir, "DECISION_RECORDED", question("Q1-Q3"));
+    drive.sent(JSON.stringify({ "Q1?": "Follow docs/spec.md exactly", "Q2?": ["No coupon", "No gift card"], "Q3?": "" }), 3);
+    const message = saveMessage(dir, {
+      session: "chat-a", at: stamp(), source: "picker", text: "Follow docs/spec.md exactly",
+      picker: [
+        { question: "Q1?", reply: "Follow docs/spec.md exactly" },
+        { question: "Q2?", reply: "No coupon, No gift card" },
+        { question: "Q3?", reply: null },
+      ],
+      words: "Follow docs/spec.md exactly\nNo coupon, No gift card", settings: [],
+      route: { scope: null, newIntent: false, skip: [], add: [], projectType: null },
+    });
+    recent(dir, "HUMAN_TURN", { Session: "chat-a", Origin: "person", Source: "picker", "Message Id": message.id });
+    recent(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: spec; Q2: no coupon, no gift card", "Message Id": message.id });
+    recent(dir, "DECISION_RECORDED", question("Q4"));
+    recent(dir, "QUESTION_ANSWERED", {
+      Stage: "requirements-analysis", Details: "Q4: B",
+      "Answer Source": "chosen by the agent, reading their message", "Message Id": message.id,
+    });
+    expect(drive.unbacked()).toEqual([]);
+  });
+
+  test("a message an approval spent does not back it", () => {
+    const dir = project();
+    const drive = new PersonTurnLedger(dir);
+    recent(dir, "STAGE_AWAITING_APPROVAL", { Stage: "reverse-engineering" });
+    const id = typed(dir, drive, "Approve");
+    recent(dir, "GATE_APPROVED", { Stage: "reverse-engineering", "User Input": "Approve", "Message Id": id });
+    recent(dir, "DECISION_RECORDED", question("Q1: no name given"));
+    recent(dir, "QUESTION_ANSWERED", { Stage: "requirements-analysis", Details: "Q1: A", "Message Id": id });
+    const problems = drive.unbacked();
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("QUESTION_ANSWERED requirements-analysis");
+  });
+});

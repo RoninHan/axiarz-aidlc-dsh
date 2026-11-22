@@ -1,0 +1,170 @@
+{
+  "sessionStart": {
+    "hook_event_name": "SessionStart",
+    "session_id": "1908a694-fc9d-470a-8b20-a01d01ffe8da",
+    "timestamp": "2026-07-24T23:07:14.077Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "source": "new",
+    "initial_prompt": "Verify the compatibility fixture."
+  },
+  "userPromptSubmit": {
+    "hook_event_name": "UserPromptSubmit",
+    "session_id": "1908a694-fc9d-470a-8b20-a01d01ffe8da",
+    "timestamp": "2026-07-24T23:07:13.973Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "prompt": "Verify the compatibility fixture."
+  },
+  "stop": {
+    "hook_event_name": "Stop",
+    "session_id": "1908a694-fc9d-470a-8b20-a01d01ffe8da",
+    "timestamp": "2026-07-24T23:07:17.637Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "transcript_path": "/workspace/copilot-fixture/session-state/1908a694-fc9d-470a-8b20-a01d01ffe8da/events.jsonl",
+    "stop_reason": "end_turn",
+    "stop_hook_active": false
+  },
+  "sessionEnd": {
+    "hook_event_name": "SessionEnd",
+    "session_id": "82c32fad-4404-40dd-9bcc-d4fde49111ef",
+    "timestamp": "2026-07-24T23:52:52.015Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "reason": "complete"
+  },
+  "subagentStop": {
+    "hook_event_name": "SubagentStop",
+    "session_id": "82c32fad-4404-40dd-9bcc-d4fde49111ef",
+    "timestamp": "2026-07-24T23:52:50.007Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "transcript_path": "/workspace/copilot-fixture/session-state/82c32fad-4404-40dd-9bcc-d4fde49111ef/events.jsonl",
+    "agent_name": "compat-probe",
+    "agent_display_name": "compat-probe",
+    "stop_reason": "end_turn"
+  },
+  "subagentStart": {
+    "sessionId": "0c98c088-dff9-44ae-b6cf-db3af2f1535b",
+    "timestamp": 1784937381583,
+    "cwd": "/workspace/copilot-fixture/proj",
+    "transcriptPath": "/workspace/copilot-fixture/session-state/0c98c088-dff9-44ae-b6cf-db3af2f1535b/events.jsonl",
+    "agentName": "compat-probe",
+    "agentDisplayName": "compat-probe",
+    "agentDescription": "Compatibility probe persona for the AIDLC spike."
+  },
+  "preToolUse_bash": {
+    "hook_event_name": "PreToolUse",
+    "session_id": "70a7069a-6c01-441b-a7a7-e6b97d61ce28",
+    "timestamp": "2026-07-25T00:32:01.748Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "echo FIXTURE-CAPTURE",
+      "description": "Echo fixture capture string"
+    }
+  },
+  "preToolUse_write": {
+    "hook_event_name": "PreToolUse",
+    "session_id": "0b5bd4e9-efbd-4d9a-af85-e27aac811a30",
+    "timestamp": "2026-07-25T00:14:51.208Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "Write",
+    "tool_input": {
+      "path": "/workspace/copilot-fixture/proj/notes.txt",
+      "file_text": "alpha"
+    }
+  },
+  "preToolUse_edit": {
+    "hook_event_name": "PreToolUse",
+    "session_id": "0b5bd4e9-efbd-4d9a-af85-e27aac811a30",
+    "timestamp": "2026-07-25T00:14:53.507Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "Edit",
+    "tool_input": {
+      "path": "/workspace/copilot-fixture/proj/notes.txt",
+      "old_str": "alpha",
+      "new_str": "beta"
+    }
+  },
+  "postToolUse_bash": {
+    "hook_event_name": "PostToolUse",
+    "session_id": "d0e7296c-f58a-4b06-9a63-d344d439f9c1",
+    "timestamp": "2026-07-24T23:15:36.341Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "echo POSTTOOL-CHECK",
+      "description": "Echo test string"
+    },
+    "tool_result": {
+      "result_type": "success",
+      "text_result_for_llm": "POSTTOOL-CHECK\n<shellId: 0 completed with exit code 0>"
+    }
+  },
+  "preToolUse_task": {
+    "hook_event_name": "PreToolUse",
+    "session_id": "89b024ae-6986-420c-bc79-13bcf3b83bdc",
+    "timestamp": "2026-10-14T06:50:52.381Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "Agent",
+    "tool_input": {
+      "description": "Simple prompt response",
+      "prompt": "Reply with the single word ok.",
+      "agent_type": "general-purpose",
+      "name": "brief-response",
+      "mode": "sync"
+    }
+  },
+  "subagentStart_task": {
+    "sessionId": "89b024ae-6986-420c-bc79-13bcf3b83bdc",
+    "timestamp": 1791960652831,
+    "cwd": "/workspace/copilot-fixture/proj",
+    "transcriptPath": "/workspace/copilot-fixture/session-state/89b024ae-6986-420c-bc79-13bcf3b83bdc/events.jsonl",
+    "agentName": "general-purpose"
+  },
+  "userPromptSubmit_subagentBrief": {
+    "hook_event_name": "UserPromptSubmit",
+    "session_id": "4f6df0dd-27ac-415a-8571-ee2f577aa047",
+    "timestamp": "2026-10-14T06:50:53.082Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "prompt": "Reply with the single word ok."
+  },
+  "subagentStop_task": {
+    "hook_event_name": "SubagentStop",
+    "session_id": "89b024ae-6986-420c-bc79-13bcf3b83bdc",
+    "timestamp": "2026-10-14T06:50:54.460Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "transcript_path": "/workspace/copilot-fixture/session-state/89b024ae-6986-420c-bc79-13bcf3b83bdc/events.jsonl",
+    "agent_id": "4f6df0dd-27ac-415a-8571-ee2f577aa047",
+    "agent_type": "general-purpose",
+    "agent_name": "general-purpose",
+    "last_assistant_message": "ok",
+    "stop_reason": "end_turn"
+  },
+  "userPromptSubmit_subagentBrief_1_0_74": {
+    "hook_event_name": "UserPromptSubmit",
+    "session_id": "call_Epd6JNkoGrvWNIMPnbxi9afV",
+    "timestamp": "2026-10-14T06:54:13.105Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "prompt": "Reply with the single word ok."
+  },
+  "preToolUse_askUserQuestion": {
+    "hook_event_name": "PreToolUse",
+    "session_id": "44e47e9b-b805-44c7-9265-342fcd064044",
+    "timestamp": "2026-10-24T09:07:31.566Z",
+    "cwd": "/workspace/copilot-fixture/proj",
+    "tool_name": "AskUserQuestion",
+    "tool_input": {
+      "message": "Which color do you prefer?",
+      "requestedSchema": {
+        "properties": {
+          "color": {
+            "type": "string",
+            "title": "Preferred color",
+            "enum": [
+              "Red",
+              "Blue"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

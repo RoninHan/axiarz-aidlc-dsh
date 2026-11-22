@@ -1,0 +1,17 @@
+[
+  "workspace-scaffold",
+  "workspace-detection",
+  "state-init",
+  "practices-discovery",
+  "requirements-analysis",
+  "nfr-requirements",
+  "nfr-design",
+  "infrastructure-design",
+  "code-generation",
+  "build-and-test",
+  "ci-pipeline",
+  "deployment-pipeline",
+  "environment-provisioning",
+  "deployment-execution",
+  "observability-setup"
+]

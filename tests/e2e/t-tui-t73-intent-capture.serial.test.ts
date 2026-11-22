@@ -1,0 +1,412 @@
+// covers: stage:ideation/intent-capture
+//
+// t-tui-t73-intent-capture.serial.test.ts - drive the IDEATION intent-capture
+// stage through a REAL keystroke-driven claude TUI and prove it produces its
+// on-disk artifacts.
+//
+// WHY PATTERN B (multi-gate journey, answer-gate --until-state-field):
+//   intent-capture is a GATED stage — it asks the user questions (a questions file
+//   gets [Answer]: lines filled) and surfaces an AskUserQuestion menu before it
+//   commits its artifacts. The journey runs multiple LLM turns and at least one
+//   rendered gate, so it is NOT a single landed-and-rendered jump (Pattern A).
+//   We answer every gate by taking the Recommended default and TERMINATE on
+//   Last Completed Stage=intent-capture AND Current Stage moving on - never on a
+//   screen string (the transcript is not a leading event bus; disk is the
+//   terminator).
+//
+// THE SEEDED REDO-JUMP:
+//   state-initialization-done.md sets Current Stage == intent-capture (the redo
+//   target) with Completed=3 / 3 [x]. Because Current Stage already equals the
+//   --stage target, aidlc-jump does NOT terminate the workflow on the jump; the
+//   stage runs, its gate approves, and approve auto-advances to the next in-scope
+//   stage (market-research). So after the journey: intent-capture flips to [x],
+//   Completed climbs past 3, and Current Stage moves off intent-capture.
+//
+// What it proves:
+//   - the intent-capture stage starts from a --stage jump
+//     (statusline shows a live IDEATION phase),
+//   - the answer-gate clears the stage's rendered AUQ menu(s) by taking the
+//     Recommended default and TERMINATES on approval AND advancement,
+//   - ON DISK:
+//       * <record>/ideation/intent-capture/ exists,
+//       * a *questions* file exists AND carries >=1 `[Answer]:` line
+//         (the gate's answers were written back),
+//       * a *intent*statement* artifact exists, is > 100 bytes, and has at least
+//         one markdown heading,
+//       * both deliverables carry source tags and an Assumptions & Open
+//         Questions section,
+//       * aidlc-state.md Completed counter == the number of `- [x]` lines
+//         (internal consistency invariant), Completed >= 4 (monotonic from the
+//         fixture's 3 + this stage), and Lifecycle Phase == IDEATION,
+//       * audit recorded a STAGE_COMPLETED for intent-capture,
+//   - RENDER (the tui-only value-add the SDK/claude-p path is blind to): the
+//     captured grid showed the AUQ select footer (`Enter to select`) and/or the
+//     multi-tab `Submit` strip at least once while the gate was up.
+//
+// REACHABILITY: intent-capture is a normal IDEATION stage
+// (not the heavy reverse-engineering stage). If approval and advancement never
+// land inside the overall-timeout, answer-gate exits nonzero (HANG BACKSTOP) and
+// this test RED — that red is a finding about stage reachability, NOT a thing to
+// soften. We assert what the stage SHOULD produce; we do not weaken to force green.
+//
+// COST: spends real Bedrock tokens (minutes-long LLM turns). Gated behind
+// AIDLC_TUI_LIVE=1 so a bare `--e2e` on a laptop SKIPs it; selected TUI substrate/claude/
+// distributable absence also SKIPs with a reason — never a hollow pass.
+//
+// Spawn tui-drive.ts using the shared runtime selector for the native Bun and
+// POSIX tmux backends. The driver subprocess remains the source of the `tui`
+// mechanism evidence.
+
+import { liveCaseTimeoutMs, LIVE_LONG_OPERATION_TIMEOUT_MS, remainingOperationTimeoutMs, remainingCleanupTimeoutMs, fileCleanupReserveMs, NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, NATIVE_STARTUP_TIMEOUT_MS } from "../harness/test-budget.ts";
+import { beforeEach, describe, expect, test } from "bun:test";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { readAllAuditShards } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import { seededRecordDir, seededStateFile } from "../harness/fixtures.ts";
+import {
+  cleanupTuiProjectAfterKill,
+  markdownH2Section,
+  setupTuiProject,
+} from "../harness/tui-fixtures.ts";
+import { resolveTuiRuntime, tuiUnavailableReason } from "../harness/tui-runtime.ts";
+
+function completedStartupProbe<T extends { error?: Error }>(result: T): T {
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") throw result.error;
+  return result;
+}
+
+const DRIVER = join(import.meta.dir, "..", "harness", "tui-drive.ts");
+const AIDLC_SRC = join(import.meta.dir, "..", "..", "dist", "claude", ".claude");
+const { bin: DRIVE_BIN, prefix: DRIVE_PREFIX } = resolveTuiRuntime(DRIVER);
+
+// Honour the suite's AIDLC_TEST_TIMEOUT convention (seconds; the integration
+// tier sets 600). A full intent-capture run-through is a few minutes of real LLM
+// turns, so the bun:test cap is generous.
+const TIMEOUT_S = Number(process.env.AIDLC_TEST_TIMEOUT);
+const TEST_TIMEOUT_MS = Number.isSafeInteger(TIMEOUT_S) && TIMEOUT_S > 0
+  ? TIMEOUT_S * 1000
+  : liveCaseTimeoutMs(LIVE_LONG_OPERATION_TIMEOUT_MS);
+let caseDeadlineMs: number;
+beforeEach(() => { caseDeadlineMs = Date.now() + TEST_TIMEOUT_MS; });
+function remainingWorkMs(): number {
+  return remainingOperationTimeoutMs(TEST_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    reserveMs: fileCleanupReserveMs(TEST_TIMEOUT_MS),
+    phase: "E2E live work",
+  })!;
+}
+function remainingCleanupMs(): number {
+  return remainingCleanupTimeoutMs(NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    phase: "E2E terminal cleanup",
+  });
+}
+
+
+
+interface Run {
+  rc: number;
+  stdout: string;
+  stderr: string;
+}
+function drive(args: string[]): Run {
+  const res = spawnSync(DRIVE_BIN, [...DRIVE_PREFIX, ...args], { timeout: args[0] === "kill" ? remainingCleanupMs() : remainingWorkMs(), encoding: "utf-8" });
+  return { rc: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+function waitFor(session: string, pattern: string, timeoutMs: number, stableMs: number): boolean {
+  return (
+    drive([
+      "wait",
+      "--session",
+      session,
+      "--pattern",
+      pattern,
+      "--timeout-ms",
+      String(timeoutMs),
+      "--stable-ms",
+      String(stableMs),
+    ]).rc === 0
+  );
+}
+
+// ABSENT / opt-in gating. The token guard AIDLC_TUI_LIVE=1 is checked FIRST so a
+// bare --e2e (no live opt-in) reports a clear skip reason, not a substrate miss.
+function skipReason(): string | null {
+  if (process.env.AIDLC_TUI_LIVE !== "1") {
+    return "set AIDLC_TUI_LIVE=1 to run the live intent-capture journey (uses Bedrock tokens)";
+  }
+  const runtimeReason = tuiUnavailableReason();
+  if (runtimeReason) return runtimeReason;
+  if (completedStartupProbe(spawnSync("claude", ["--version"], { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" })).status !== 0) {
+    return "claude CLI not found";
+  }
+  if (!existsSync(AIDLC_SRC)) return `distributable missing: ${AIDLC_SRC}`;
+  return null;
+}
+const SKIP_REASON = skipReason();
+
+// Find the first file under `dir` whose basename matches every fragment (case-
+// insensitive), excluding any in `exclude`.
+function findArtifact(dir: string, fragments: string[], exclude: string[] = []): string | null {
+  if (!existsSync(dir)) return null;
+  for (const entry of readdirSync(dir)) {
+    const lower = entry.toLowerCase();
+    if (exclude.some((x) => lower.includes(x.toLowerCase()))) continue;
+    if (fragments.every((f) => lower.includes(f.toLowerCase()))) {
+      const full = join(dir, entry);
+      try {
+        if (statSync(full).isFile()) return full;
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return null;
+}
+
+describe("t-tui-t73-intent-capture (answering the stage gate produces artifacts on disk)", () => {
+  test.skipIf(SKIP_REASON !== null)(
+    `intent-capture jump commits intent-statement + answered questions on disk${SKIP_REASON ? ` — SKIP: ${SKIP_REASON}` : ""}`,
+    async () => {
+      const session = `aidlc_tui_t73_${process.pid}`;
+      // Seed state at init-done (intent-capture next/current),
+      // greenfield stub (drives workspace-detection to Greenfield), audit present.
+      const sandbox = setupTuiProject({
+        withState: "state-initialization-done.md",
+        greenfieldStub: true,
+        withAudit: true,
+        runtimeGraph: true,
+      });
+      // The render value-add: tail the grid during the run to prove the AUQ menu
+      // painted at least once (the SDK path can't see it).
+      let sawSelectFooter = false;
+      let sawSubmitStrip = false;
+      let pollTimer: ReturnType<typeof setInterval> | undefined;
+      try {
+        // --- launch the claude TUI in the seeded sandbox ----------------------
+        expect(drive([
+          "start",
+          "--session",
+          session,
+          "--cwd",
+          sandbox,
+          "--width",
+          "120",
+          "--height",
+          "45",
+          "--",
+          "claude",
+          "--dangerously-skip-permissions",
+        ]).rc).toBe(0);
+
+        // clear the two startup modals (idempotent — only act if present)
+
+        const startup = drive([
+          "startup", "--session", session,
+          "--ready-pattern", "\\[AIDLC\\].*IDEATION", "--timeout-ms", String(remainingWorkMs()),
+        ]);
+        expect(startup.rc).toBe(0);
+        // Seeded state => the workflow statusline paints the live IDEATION phase
+        // (not the no-workflow "ready" line). Wait for it before driving.
+        expect(waitFor(session, "\\[AIDLC\\].*IDEATION", remainingWorkMs(), 800)).toBe(true);
+
+        // --- submit the stage-jump WITH a build description -------------------
+        // intent-capture.md Step 2 reads the project description from "$ARGUMENTS
+        // or audit.md". Jumping with a BARE `/aidlc --stage intent-capture` (no
+        // description) makes the stage ask "What would you like to build?" as a
+        // free-text prompt that answer-gate (keystroke-only) cannot fill → hang
+        // (verified live 2026-06-06). Passing the description as trailing freeform
+        // lands it in $ARGUMENTS, so the stage proceeds straight to its clarifying
+        // questions (verified live: the description was honoured, no re-ask). Send
+        // literally (spaces) with no auto-Enter, then Enter as a named key.
+        drive([
+          "send",
+          "--session",
+          session,
+          "--keys",
+          "/aidlc --stage intent-capture Build a simple React todo app",
+          "--literal",
+          "--no-enter",
+        ]);
+        drive(["send", "--session", session, "--keys", "Enter", "--no-enter"]);
+
+        // Confirm the stage actually started running (the statusline stays in a
+        // live IDEATION phase while turns stream). --stable-ms 0: the screen is
+        // streaming (token counter / spinner), so match the instant it appears.
+        expect(waitFor(session, "\\[AIDLC\\].*IDEATION", remainingWorkMs(), 0)).toBe(true);
+
+        // Begin tailing the grid for the render assertion BEFORE answer-gate runs,
+        // so we catch the AUQ select footer + multi-tab Submit strip while the
+        // gate is up.
+        pollTimer = setInterval(() => {
+          const grid = drive(["capture", "--session", session]).stdout;
+          if (grid.includes("Enter to select")) sawSelectFooter = true;
+          if (grid.includes("Submit")) sawSubmitStrip = true;
+        }, 1000);
+
+        // --- answer the gate(s) via the shared answer-gate primitive (section 3) ------
+        // It answers each menu (single-select Enter / multi-select Space-toggle +
+        // arrow-navigate to Submit / the "Looks correct" confirmation / the
+        // final Approve gate) by taking the Recommended default, and TERMINATES on
+        // an on-disk STATE signal, NOT a screen string. Run it as a long-lived
+        // subprocess; its own backstops error loud, so a hang surfaces as a nonzero
+        // exit (a FINDING about reachability, not a thing to soften).
+        //
+        // TERMINATOR = `Last Completed Stage` reaching `intent-capture` AND
+        // `Current Stage` moving on. The intent-statement *file* lands mid-Step-4,
+        // BEFORE the stakeholder-map (rest of Step 4), the completion handoff (Step 6)
+        // and the Step 7 approval gate - so terminating on it stopped the loop too
+        // early (stakeholder-map absent, no STAGE_COMPLETED). handleApprove writes
+        // Last Completed Stage first (aidlc-state.ts); only then does handleAdvance
+        // write Current Stage. The loop polls disk first, and the test kills the
+        // session ~60 ms after termination: watching only Last Completed Stage killed
+        // approve between these writes (GATE_APPROVED present, no next-stage
+        // STAGE_STARTED). Waiting for BOTH keeps that kill from landing mid-approve.
+        const gateRc = await new Promise<number>((resolve) => {
+          const child = spawn(
+            DRIVE_BIN,
+            [
+              ...DRIVE_PREFIX,
+              "answer-gate",
+              "--session",
+              session,
+              "--project-dir",
+              sandbox,
+              "--overall-timeout-ms",
+              String(remainingWorkMs()),
+              // At the mandatory summary menu, artifact generation must not have
+              // begun. The driver checks this synchronously before selecting the
+              // highlighted Looks correct option.
+              "--assert-file-absent-at-option",
+              "Looks correct",
+              "--assert-file-absent",
+              "aidlc/spaces/default/intents/*/ideation/intent-capture/*intent*statement*",
+              // Wait for approval AND advancement (aidlc-state.ts handleApprove and
+              // handleAdvance), not just the first write. Keep the completed
+              // stage anchored exactly so the kill cannot land mid-approve.
+              "--until-state-field",
+              "Last Completed Stage=^intent-capture$",
+              "--also-state-field",
+              "Current Stage=^(?!intent-capture$).+",
+            ],
+            { timeout: remainingWorkMs(), killSignal: "SIGKILL", stdio: "inherit" },
+          );
+          child.on("exit", (code) => resolve(code ?? -1));
+          child.on("error", () => resolve(-1));
+        });
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = undefined;
+        expect(gateRc).toBe(0);
+
+        // --- assert ON DISK --------------
+        const icDir = join(seededRecordDir(sandbox), "ideation", "intent-capture");
+        expect(existsSync(icDir)).toBe(true);
+
+        // A *questions* file exists AND has >=1 [Answer]: line.
+        // We assert the answers were really written.
+        const questionsFile = findArtifact(icDir, ["questions"]);
+        expect(questionsFile).not.toBeNull();
+        const questionsBody = readFileSync(questionsFile as string, "utf8");
+        const answerCount = (questionsBody.match(/\[Answer\]:/g) ?? []).length;
+        expect(answerCount).toBeGreaterThan(0);
+        expect(questionsBody).toContain("## Sources");
+        expect(questionsBody).toContain("[desc]");
+        expect(questionsBody).toContain("[scope]");
+        const summaryConfirmation = markdownH2Section(
+          questionsBody,
+          "Consolidated Summary Confirmation",
+        );
+        expect(summaryConfirmation).toContain("[Answer]: Looks correct");
+        expect(summaryConfirmation).not.toMatch(
+          /\[Answer\]:\s*(?:[A-Z]|\d+)\.?\s+Looks correct/,
+        );
+
+        const intentFile = findArtifact(icDir, ["intent", "statement"]);
+        expect(intentFile).not.toBeNull();
+        const intentBody = readFileSync(intentFile as string, "utf8");
+        expect(Buffer.byteLength(intentBody, "utf8")).toBeGreaterThan(100);
+        expect(intentBody).toMatch(/^#/m);
+        expect(intentBody).toContain("## Assumptions & Open Questions");
+        expect(intentBody).toMatch(
+          /\[(?:desc|scope|Q\d+|memory:[A-Za-z0-9][A-Za-z0-9._-]*|assumption)\]/,
+        );
+
+        // A *stakeholder* map artifact exists. The grounding
+        // contract additionally requires source tags and assumption surfacing.
+        const stakeholderFile = findArtifact(icDir, ["stakeholder"]);
+        expect(stakeholderFile).not.toBeNull();
+        const stakeholderBody = readFileSync(stakeholderFile as string, "utf8");
+        expect(stakeholderBody).toContain("## Assumptions & Open Questions");
+        expect(stakeholderBody).toMatch(
+          /\[(?:desc|scope|Q\d+|memory:[A-Za-z0-9][A-Za-z0-9._-]*|assumption)\]/,
+        );
+
+        // --- state invariants ---------------------
+        const stateMd = readFileSync(seededStateFile(sandbox), "utf8");
+        const xCount = (stateMd.match(/^- \[x\]/gm) ?? []).length;
+        const completedMatch = /\*\*Completed\*\*:[ \t]*(\d+)/.exec(stateMd);
+        expect(completedMatch).not.toBeNull();
+        const completed = Number.parseInt((completedMatch as RegExpExecArray)[1], 10);
+        expect(completed).toBe(xCount);
+        // Completed >= 4 (monotonic - fixture seeds 3, this stage adds >=1).
+        expect(xCount).toBeGreaterThan(3);
+        // Lifecycle phase is IDEATION (set by fixture, held by the stage).
+        expect(stateMd).toContain("IDEATION");
+
+        // The redo-jump advancement: intent-capture is [x] and Current
+        // Stage moved off it. The fixture set Current Stage == target, so the jump
+        // doesn't terminate; the stage's gate approve auto-advances.
+        expect(stateMd).toMatch(/- \[x\] intent-capture/);
+        const currentStageLine =
+          /\*\*Current Stage\*\*:[ \t]*([^\r\n]*)/.exec(stateMd)?.[1]?.trim() ?? "";
+        expect(currentStageLine.length).toBeGreaterThan(0);
+        expect(currentStageLine.toLowerCase()).not.toContain("intent-capture");
+
+        // --- audit assertion -
+        const auditMd = readAllAuditShards(sandbox);
+        expect(auditMd).toMatch(/STAGE_COMPLETED/);
+        expect(auditMd.toLowerCase()).toContain("intent-capture");
+        // The FIRST confirmation receipt must precede the first GENERATED
+        // deliverable. The audit hook logs every net-new record-tree file, so
+        // the stage diary (memory.md) and the pre-Q&A questions file both
+        // legitimately emit ARTIFACT_CREATED before the checkpoint - the pin
+        // is on the produces[] deliverables the checkpoint actually gates
+        // (intent-statement / stakeholder-map), and indexOf (not lastIndexOf)
+        // on the receipt so a request-changes re-confirm loop cannot mask a
+        // pre-confirmation write.
+        const summaryConfirmedAt = auditMd.indexOf(
+          "**Event**: SUMMARY_CONFIRMATION_RECORDED",
+        );
+        const generatedArtifactAt = auditMd.search(
+          /\*\*Event\*\*: ARTIFACT_CREATED\n(?:\*\*[^\n]+\n)*?\*\*File\*\*: [^\n]*(?:intent-statement|stakeholder-map)/,
+        );
+        expect(summaryConfirmedAt).toBeGreaterThan(-1);
+        expect(generatedArtifactAt).toBeGreaterThan(summaryConfirmedAt);
+
+        // --- no learnings question with nothing corrected ----------------------
+        // The person picked the defaults and corrected nothing, so the learnings
+        // step asks nothing and the gate follows the summary.
+        expect(auditMd).not.toMatch(/\*\*Question Kind\*\*: learnings-note/);
+        expect(auditMd).not.toMatch(
+          /\*\*Event\*\*: DECISION_RECORDED\n(?:\*\*[^\n]+\n)*?\*\*Options\*\*: [^\n]*Nothing to add[^\n]*Add a note/,
+        );
+        expect(auditMd.lastIndexOf("**Event**: STAGE_AWAITING_APPROVAL")).toBeGreaterThan(-1);
+
+        // --- render assertion (the tui-only value-add) -----------------------
+        // The captured grid showed the AUQ select footer and/or the multi-tab
+        // Submit strip at least once during the run — what the SDK path is blind
+        // to. (intent-capture raises at least one AskUserQuestion gate.)
+        expect(sawSelectFooter || sawSubmitStrip).toBe(true);
+      } finally {
+        if (pollTimer) clearInterval(pollTimer);
+        cleanupTuiProjectAfterKill(
+          sandbox,
+          session,
+          drive(["kill", "--session", session]),
+        );
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});

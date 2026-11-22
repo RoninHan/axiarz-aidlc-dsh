@@ -1,0 +1,1131 @@
+// Shared fixture for the t326 pinned team Unit merge suites
+// (tests/integration/t326-team-unit-merge*.test.ts). The cases live in four
+// files so the integration tier can run them in parallel: one file ran for
+// about 20 minutes on a Windows runner, and with two the longer one still set
+// the Windows integration leg's length.
+
+import { expect } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import {
+  artifactFilename,
+  auditShardName,
+  loadStageGraphAll,
+  readUnitMergeTransaction,
+  reviewArtifactFingerprint,
+  reviewRecordDigest,
+  reviewRecordRelativePath,
+  serializeReviewRecord,
+  type ReviewRecord,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import {
+  approvalFingerprint,
+  renderTestingContract,
+  resolveTestingPosture,
+} from "../../dist/claude/.claude/tools/aidlc-testing-posture.ts";
+import {
+  AIDLC_SRC,
+  DEFAULT_RECORD_DIR,
+  DEFAULT_SPACE,
+  cleanupTestProject,
+  createTestProject,
+  intentsDirOf,
+  seedAidlcMemory,
+  seededAuditDir,
+  seededRecordDir,
+  seededStateFile,
+} from "./fixtures.ts";
+import { FILE_ATTEMPT_ENV } from "../lib/file-retry.ts";
+
+// Git 2.47 and later start `git maintenance run --auto` in the background
+// after a command writes objects, and from 2.54 that run repacks, deleting
+// packed loose objects and the objects/xx directories they leave empty. These
+// suites run git back to back in small repositories, so the next command's
+// object write could lose its fresh objects/xx directory and fail with "unable
+// to create temporary file: No such file or directory". Every git process the
+// suites start, the shipped tools' included, inherits this switch-off.
+export const AUTOMATIC_GIT_MAINTENANCE_OFF: Readonly<Record<string, string>> = {
+  "maintenance.auto": "false",
+  "gc.auto": "0",
+  "receive.autogc": "false",
+};
+
+export function withoutAutomaticGitMaintenance(env: NodeJS.ProcessEnv): void {
+  let count = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  if (!Number.isInteger(count) || count < 0) count = 0;
+  for (const [key, value] of Object.entries(AUTOMATIC_GIT_MAINTENANCE_OFF)) {
+    env[`GIT_CONFIG_KEY_${count}`] = key;
+    env[`GIT_CONFIG_VALUE_${count}`] = value;
+    count++;
+  }
+  env.GIT_CONFIG_COUNT = String(count);
+}
+withoutAutomaticGitMaintenance(process.env);
+
+export const UNIT = join(AIDLC_SRC, "tools", "aidlc-unit.ts");
+export const ORCH = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
+export const BOLT = join(AIDLC_SRC, "tools", "aidlc-bolt.ts");
+export const STATE = join(AIDLC_SRC, "tools", "aidlc-state.ts");
+export const tempDirs: string[] = [];
+
+/** Remove every checkout and remote a case created; register as afterEach. */
+export function cleanupTempDirs(): void {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop()!;
+    if (dir.includes("aidlc-test-")) cleanupTestProject(dir);
+    else rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+export function git(cwd: string, args: string[]): string {
+  const result = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  if ((result.status ?? 1) !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+  return (result.stdout ?? "").trim();
+}
+
+export function runMergeTool(
+  tool: string,
+  args: string[],
+  cwd: string,
+  enforceHumanPresence = false,
+  extraEnv: Record<string, string> = {},
+): { status: number; stdout: string; out: string } {
+  // Keep Git's diagnostics for Windows claim/pin failures and receipt
+  // revalidation during gate/land on every platform.
+  // Store traces outside the checkout so dirty-tree policies stay meaningful.
+  const reviewOperation = tool === UNIT && (args[0] === "gate" || args[0] === "land");
+  const windowsClaimOrPin = process.platform === "win32" && tool === UNIT &&
+    (args[0] === "claim" || args[0] === "pin");
+  // On Windows the trace costs about a quarter of each of these calls, so a
+  // file's first attempt under a runner that retries goes without it; the
+  // retry of a failed file, a run that does not retry and a run outside the
+  // runner trace again. The retry
+  // rule (tests/lib/file-retry.ts) does not retry a file whose first attempt
+  // ran long, so the pinned-merge diagnostics below print untraced too.
+  const windowsFirstAttempt = process.platform === "win32" && process.env[FILE_ATTEMPT_ENV] === "1";
+  const traceNeeded = (reviewOperation || windowsClaimOrPin) && !windowsFirstAttempt;
+  const traceDir = traceNeeded && extraEnv.GIT_TRACE2_EVENT === undefined
+    ? mkdtempSync(join(tmpdir(), "aidlc-inc3-git-trace-"))
+    : null;
+  if (traceDir) tempDirs.push(traceDir);
+  const tracePath = extraEnv.GIT_TRACE2_EVENT ??
+    (traceDir ? join(traceDir, "git-events.ndjson") : null);
+  const result = spawnSync(
+    process.execPath,
+    [tool, ...args, "--project-dir", cwd],
+    {
+      cwd,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_SKIP_HUMAN_PRESENCE_GUARD: enforceHumanPresence ? "0" : "1",
+        AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+        AIDLC_SKIP_ARTIFACT_GUARD: "1",
+        ...(tracePath ? { GIT_TRACE2_EVENT: tracePath.replaceAll("\\", "/") } : {}),
+        ...extraEnv,
+      },
+    },
+  );
+  const out = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  const reviewUnit = reviewOperation ? args[1] : undefined;
+  if (result.status !== 0 && reviewUnit &&
+      (out.includes("has no review that stands for") || out.includes("candidate-exact"))) {
+    console.error(`t326 merge validation failed:\n${JSON.stringify({
+      args, status: result.status, signal: result.signal, error: result.error?.message, out,
+    }, null, 2)}`);
+    reportPinnedMergeFailure(cwd, reviewUnit, tracePath, out);
+  } else if (result.status !== 0 && windowsClaimOrPin && tracePath && existsSync(tracePath)) {
+    console.error(`t326 ${args[0]} Git trace (${tracePath}):\n${readFileSync(tracePath, "utf-8")}`);
+  }
+  return {
+    status: result.status ?? -1,
+    stdout: result.stdout ?? "",
+    out,
+  };
+}
+
+// Publish a candidate the way a forger would: a claim commit over whatever
+// the worktree holds, pushed straight to the claim ref with the same
+// compare-and-swap `aidlc unit publish` uses. Publish itself projects the
+// claim-bound audit shard onto the transportable evidence before it builds the
+// candidate tree, so it is not the path that puts a withheld row in front of
+// pin - this is. Pin's own refusals are what this exercises.
+export function pushUnprojectedCandidate(checkout: string, unit: string): void {
+  const stamp = JSON.parse(
+    readFileSync(join(checkout, "aidlc", ".aidlc-unit-scope.json"), "utf-8"),
+  ) as { claim_ref: string };
+  const claimOid = git(checkout, ["ls-remote", "origin", stamp.claim_ref])
+    .split(/\s+/)[0] ?? "";
+  expect(claimOid, `no claim tip at ${stamp.claim_ref} for Unit ${unit}`)
+    .toMatch(/^[0-9a-f]{40}$/);
+  const payload = JSON.parse(
+    git(checkout, ["show", `${claimOid}:.aidlc-unit-claim.json`, "--"]),
+  );
+  const headOid = git(checkout, ["rev-parse", "HEAD"]);
+  const headTree = git(checkout, ["rev-parse", "HEAD^{tree}"]);
+  // Only the candidate identity moves; the claim keeps the base and
+  // integration ref publish already recorded, so pin reads a live candidate.
+  const forged = `${JSON.stringify({
+    ...payload,
+    predecessor_oid: claimOid,
+    candidate_tree_oid: headTree,
+    candidate_head_oid: headOid,
+  }, null, 2)}\n`;
+  const scratch = mkdtempSync(join(tmpdir(), "aidlc-inc3-forge-"));
+  tempDirs.push(scratch);
+  const index = join(scratch, "index");
+  const plumb = (args: string[], input?: string): string => {
+    const result = spawnSync("git", args, {
+      cwd: checkout,
+      encoding: "utf-8",
+      input,
+      env: { ...process.env, GIT_INDEX_FILE: index },
+    });
+    if ((result.status ?? 1) !== 0) {
+      throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+    }
+    return (result.stdout ?? "").trim();
+  };
+  plumb(["read-tree", headTree]);
+  const blob = plumb(["hash-object", "-w", "--stdin"], forged);
+  plumb([
+    "update-index",
+    "--add",
+    "--cacheinfo",
+    `100644,${blob},.aidlc-unit-claim.json`,
+  ]);
+  const commit = plumb([
+    "commit-tree",
+    plumb(["write-tree"]),
+    "-p",
+    claimOid,
+    "-p",
+    headOid,
+    "-m",
+    `forged publish: ${unit}`,
+  ]);
+  git(checkout, [
+    "push",
+    "origin",
+    `--force-with-lease=${stamp.claim_ref}:${claimOid}`,
+    `${commit}:${stamp.claim_ref}`,
+  ]);
+}
+
+export function stateBody(): string {
+  return `# AI-DLC State Tracking
+
+## Project Information
+- **Project**: inc3 merge
+- **Project Type**: Greenfield
+- **Scope**: feature
+- **State Version**: 8
+
+## Runtime State
+- **Revision Count**: 0
+- **Construction Iteration**: unit-major
+- **Unit Ownership**: team
+- **Unit Gate Rhythm**: per-stage
+- **Review Override**: adversarial
+- **Worktree Path**:
+- **Bolt Refs**:
+
+## Stage Progress
+
+### CONSTRUCTION PHASE
+- [-] functional-design — EXECUTE
+- [ ] nfr-requirements — EXECUTE
+- [ ] nfr-design — EXECUTE
+- [ ] infrastructure-design — EXECUTE
+- [ ] code-generation — EXECUTE
+- [ ] build-and-test — EXECUTE
+- [ ] ci-pipeline — EXECUTE
+
+## Unit Progress
+| unit | owner | functional-design | nfr-requirements | nfr-design | infrastructure-design | code-generation | gate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| skeleton | - | [x] | [x] | [x] | [x] | [x] | [x] |
+| alpha | - | [ ] | [ ] | [ ] | [ ] | [ ] | [ ] |
+| beta | - | [ ] | [ ] | [ ] | [ ] | [ ] | [ ] |
+
+## Current Status
+- **Lifecycle Phase**: CONSTRUCTION
+- **Current Stage**: functional-design
+- **Status**: Running
+- **Last Updated**: 2026-08-20T00:00:00Z
+`;
+}
+
+export function dependencyBody(): string {
+  return `# Unit dependencies
+
+\`\`\`yaml
+units:
+  - name: skeleton
+    depends_on: []
+  - name: alpha
+    depends_on: [skeleton]
+  - name: beta
+    depends_on: [alpha]
+\`\`\`
+`;
+}
+
+export function parallelDependencyBody(): string {
+  return `# Unit dependencies
+
+\`\`\`yaml
+units:
+  - name: skeleton
+    depends_on: []
+  - name: alpha
+    depends_on: [skeleton]
+  - name: beta
+    depends_on: [skeleton]
+\`\`\`
+`;
+}
+
+export function makeSeed(
+  dependencies = dependencyBody(),
+): { seed: string; remote: string } {
+  const seed = createTestProject();
+  tempDirs.push(seed);
+  seedAidlcMemory(seed);
+  writeFileSync(seededStateFile(seed), stateBody());
+  const depDir = join(seededRecordDir(seed), "inception", "units-generation");
+  mkdirSync(depDir, { recursive: true });
+  writeFileSync(join(depDir, "unit-of-work-dependency.md"), dependencies);
+  mkdirSync(seededAuditDir(seed), { recursive: true });
+  mkdirSync(join(seed, "src"), { recursive: true });
+  writeFileSync(
+    join(seed, "src", "shared.ts"),
+    'export const left = "base";\n' +
+      'export const keep1 = "same";\n' +
+      'export const keep2 = "same";\n' +
+      'export const keep3 = "same";\n' +
+      'export const right = "base";\n',
+  );
+  completeUnitOnMain(seed, "skeleton");
+  // The block AI-DLC ships, so the fixture commits exactly what a real
+  // clone's `git add -A` commits (its engine folders stay out).
+  writeFileSync(
+    join(seed, ".gitignore"),
+    readFileSync(join(AIDLC_SRC, "..", ".gitignore"), "utf-8"),
+  );
+  git(seed, ["init", "-b", "main"]);
+  git(seed, ["config", "user.name", "main"]);
+  git(seed, ["config", "user.email", "main@example.test"]);
+  git(seed, ["add", "-A"]);
+  git(seed, ["commit", "-m", "seed"]);
+  const remote = mkdtempSync(join(tmpdir(), "aidlc-inc3-remote-"));
+  tempDirs.push(remote);
+  git(remote, ["init", "--bare"]);
+  // A push runs receive-pack in the remote without the environment's config,
+  // so the remote carries the same switch-off in its own config.
+  for (const [key, value] of Object.entries(AUTOMATIC_GIT_MAINTENANCE_OFF)) git(remote, ["config", key, value]);
+  git(seed, ["remote", "add", "origin", remote]);
+  git(seed, ["push", "-u", "origin", "main"]);
+  git(remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+  // The lead's own checkout: the plan's approval in its own shard, pushed, so
+  // every other clone of the remote is another checkout of the plan.
+  const lead = clone(remote, "main");
+  asLeadsOwnCheckout(lead);
+  git(lead, ["add", "-A"]);
+  git(lead, ["commit", "-m", "the lead's plan"]);
+  git(lead, ["push", "origin", "main"]);
+  return { seed: lead, remote };
+}
+
+export function clone(remote: string, label: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `aidlc-inc3-${label}-`));
+  rmSync(dir, { recursive: true, force: true });
+  // Git's local clone optimization can race with source-repository updates.
+  git(tmpdir(), ["clone", "--no-local", remote, dir]);
+  tempDirs.push(dir);
+  git(dir, ["config", "user.name", label]);
+  git(dir, ["config", "user.email", `${label}@example.test`]);
+  // The selection is the person's own and stays out of git: in a new clone
+  // they pick the work once.
+  writeFileSync(join(dir, "aidlc", "active-space"), `${DEFAULT_SPACE}\n`);
+  writeFileSync(join(intentsDirOf(dir), "active-intent"), `${DEFAULT_RECORD_DIR}\n`);
+  return dir;
+}
+
+// A world (a remote and the checkouts made from it) that several cases of a
+// file start from is built once, and each case gets its own copy. Building it
+// goes through the engine's own claim, publish, pin, gate and land, about a
+// thousand git processes, which is most of a case on Windows; a copy of its
+// few hundred small files is under a second. No engine record of a world
+// names one of its folders (only git's origin, FETCH_HEAD and reflogs name
+// the remote), so a copy is the same world once each checkout's origin points
+// at the copied remote and its index has the new files' stats. The built
+// folders stay until cleanupWorlds, which a file registers with afterAll.
+const worlds: Array<{ remote: string; refs: string; dirs: string[] }> = [];
+
+export function builtOnce<W extends { remote: string }>(build: () => W): () => W {
+  let built: W | undefined;
+  return () => {
+    if (!built) {
+      const mark = tempDirs.length;
+      built = build();
+      worlds.push({ remote: built.remote, refs: git(built.remote, ["for-each-ref"]), dirs: tempDirs.splice(mark) });
+    }
+    const remote = copyFolder(built.remote);
+    const copy: Record<string, unknown> = { ...built, remote };
+    for (const [key, value] of Object.entries(built)) {
+      if (key === "remote" || typeof value !== "string" || !isAbsolute(value) || !existsSync(join(value, ".git"))) continue;
+      const checkout = copyFolder(value);
+      git(checkout, ["remote", "set-url", "origin", remote]);
+      // --unmerged: a world can hold a checkout stopped mid-rebase.
+      git(checkout, ["update-index", "-q", "--unmerged", "--refresh"]);
+      copy[key] = checkout;
+    }
+    return copy as W;
+  };
+}
+
+// Beside the original with its name's prefix (mkdtemp adds six characters), so
+// the copy has the path shape its original had.
+function copyFolder(dir: string): string {
+  const to = mkdtempSync(join(dirname(dir), basename(dir).slice(0, -6)));
+  tempDirs.push(to);
+  // Kept mtimes: the engine compares some of its files' times.
+  cpSync(dir, to, { recursive: true, preserveTimestamps: true });
+  return to;
+}
+
+/** Removes the built worlds, after checking that no case pushed into one. */
+export function cleanupWorlds(): void {
+  const moved: string[] = [];
+  for (const world of worlds.splice(0)) {
+    tempDirs.push(...world.dirs);
+    if (git(world.remote, ["for-each-ref"]) !== world.refs) moved.push(world.remote);
+  }
+  cleanupTempDirs();
+  expect(moved, "a case pushed into a built world instead of its copy").toEqual([]);
+}
+
+export function auditBlock(
+  event: string,
+  unit: string,
+  generation: number,
+  stage: string,
+  extra = "",
+  runFloor = "unstarted#0",
+): string {
+  return `## ${event}
+**Timestamp**: 2026-08-20T01:00:00Z
+**Event**: ${event}
+**Stage**: ${stage}
+**Unit**: ${unit}
+**Run floor**: ${runFloor}
+**Attempt Generation**: ${generation}
+${extra}
+---
+`;
+}
+
+export function reviewAuditExtras(
+  projectDir: string,
+  stage: string,
+  unit: string,
+  reviewer: string,
+  fingerprint: string,
+  nonce: string,
+  // A review the reviewer left NOT-READY, or a later pass of the stage's review.
+  options: { verdict?: "READY" | "NOT-READY"; iteration?: number } = {},
+): { request: string; completion: string } {
+  const verdict = options.verdict ?? "READY";
+  const iteration = options.iteration ?? 1;
+  const requestId = `review:${createHash("sha256").update(nonce).digest("hex").slice(0, 32)}`;
+  const attempt = createHash("sha256").update(`attempt:${nonce}`).digest("hex").slice(0, 16);
+  const record: ReviewRecord = {
+    version: 1,
+    stage,
+    unit,
+    workflow: null,
+    attempt,
+    iteration,
+    reviewer,
+    verdict,
+    request_id: requestId,
+    request_challenge: null,
+    artifact_fingerprint: fingerprint,
+    source_fingerprint: null,
+    unit_source_fingerprint: null,
+    findings: [],
+    body: `**Verdict:** ${verdict}\n**Reviewer:** ${reviewer}\n**Iteration:** ${iteration}\n`,
+    recorded_at: "2026-08-20T01:00:00Z",
+  };
+  const bytes = serializeReviewRecord(record);
+  const path = reviewRecordRelativePath(stage, unit, attempt, iteration);
+  const target = join(seededRecordDir(projectDir), ...path.split("/"));
+  mkdirSync(join(target, ".."), { recursive: true });
+  writeFileSync(target, bytes);
+  return {
+    request:
+      `**Reviewer**: ${reviewer}\n**Iteration**: ${iteration}\n` +
+      `**Artifact Fingerprint**: ${fingerprint}\n**Request Id**: ${requestId}\n`,
+    completion:
+      `**Reviewer**: ${reviewer}\n**Iteration**: ${iteration}\n` +
+      `**Verdict**: ${verdict}\n**Request Fingerprint**: ${fingerprint}\n` +
+      `**Artifact Fingerprint**: ${fingerprint}\n**Request Id**: ${requestId}\n` +
+      `**Review Record**: ${path}\n**Review Record Digest**: ${reviewRecordDigest(bytes)}\n`,
+  };
+}
+
+// The fixture cleanup removes candidate checkouts even when an assertion fails.
+// Keep the pinned inputs and the original Git command outcomes in the test log
+// when any gate/land call rejects review evidence or candidate-exact content.
+export function reportPinnedMergeFailure(
+  projectDir: string,
+  unit: string,
+  tracePath: string | null,
+  failureOutput: string,
+): void {
+  try {
+    const prefix = relative(projectDir, seededRecordDir(projectDir)).replaceAll("\\", "/");
+    const filesAt = (oid: string) => {
+      const paths = git(projectDir, ["ls-tree", "-r", "--name-only", oid, "--", prefix])
+        .split("\n").filter(Boolean);
+      return Object.fromEntries(paths.map((path) => {
+        const result = spawnSync("git", ["show", `${oid}:${path}`, "--"], {
+          cwd: projectDir,
+          encoding: "utf-8",
+        });
+        return [path, {
+          status: result.status,
+          signal: result.signal,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          error: result.error?.message,
+        }];
+      }));
+    };
+    const transaction = readUnitMergeTransaction(projectDir, unit);
+    const pinnedOid = transaction?.pinned_oid ?? null;
+    const landingHead = git(projectDir, ["rev-parse", "HEAD"]);
+    let candidateExact = null;
+    try { candidateExact = JSON.parse(failureOutput).candidate_exact ?? null; } catch { /* Keep the other captures. */ }
+    const readBlob = (oid: string | null, treeish: string, path: string) => {
+      const args = oid ? ["cat-file", "blob", oid] : ["show", `${treeish}:${path}`, "--"];
+      const result = spawnSync("git", args, {
+        cwd: projectDir,
+        env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+        maxBuffer: 64 * 1024,
+      });
+      const bytes = result.stdout ?? Buffer.alloc(0);
+      return {
+        args, status: result.status, signal: result.signal,
+        error: result.error?.message,
+        errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code,
+        stderr: result.stderr?.toString("utf8"),
+        capturedBytes: bytes.length,
+        capturedSha256: createHash("sha256").update(bytes).digest("hex"),
+        capturedBase64: bytes.toString("base64"),
+        utf8Preview: bytes.toString("utf8").slice(0, 4000),
+      };
+    };
+    const mismatches = candidateExact?.object_mismatches ?? [];
+    // Read the captured identities, including a rolled-back commit, before
+    // cleanup. These probes supplement rather than replace the original reads.
+    const blobComparisons = mismatches.slice(0, 8).map((entry: {
+      path: string; expected_treeish: string;
+      actual: { oid: string | null }; expected: { oid: string | null };
+    }) => ({
+      path: entry.path,
+      expectedAfterFailure: readBlob(entry.expected.oid, entry.expected_treeish, entry.path),
+      actualAfterFailure: readBlob(entry.actual.oid, candidateExact.treeish, entry.path),
+      pendingAfterFailure: candidateExact.passed_pending_tree_oid
+        ? readBlob(null, candidateExact.passed_pending_tree_oid, entry.path)
+        : null,
+    }));
+    console.error(`t326 pinned merge diagnostics:\n${JSON.stringify({
+      unit,
+      pinnedOid,
+      landingHead,
+      transaction,
+      candidateExact,
+      blobComparisons,
+      omittedBlobComparisons: Math.max(0, mismatches.length - blobComparisons.length),
+      pinnedFiles: pinnedOid ? filesAt(pinnedOid) : null,
+      landingFiles: filesAt(landingHead),
+      checkedTreeFiles: candidateExact?.treeish ? filesAt(candidateExact.treeish) : null,
+      passedPendingTreeFiles: candidateExact?.passed_pending_tree_oid
+        ? filesAt(candidateExact.passed_pending_tree_oid)
+        : null,
+    }, null, 2)}`);
+  } catch (error) {
+    console.error(`t326 pinned merge diagnostics unavailable: ${String(error)}`);
+  }
+  if (!tracePath) {
+    console.error("t326 landing Git trace: off on a Windows first attempt; a retry of this file traces it");
+    return;
+  }
+  try {
+    console.error(`t326 landing Git trace:\n${readFileSync(tracePath, "utf-8")}`);
+  } catch (error) {
+    console.error(`t326 landing Git trace unavailable: ${String(error)}`);
+  }
+}
+
+export function prepareCandidate(
+  remote: string,
+  unit: string,
+  label: string,
+  options: {
+    /** Works the Unit in this existing checkout instead of a fresh clone. */
+    checkout?: string;
+    mergeHeld?: boolean;
+    sourceText?: string;
+    sharedText?: string;
+    wave?: boolean;
+    /** The stage documents are written and committed with CRLF line endings
+     *  (core.autocrlf off and an editor that writes CRLF). */
+    crlf?: boolean;
+    /** The recorded Plan Approval answer line; the engine's recorder writes the
+     *  chosen option with its letter by default. */
+    answerLine?: string;
+    /** The plan's Testing Contract read the earlier way (over the raw section
+     *  text), as a plan approved before the update carries it. */
+    earlierContract?: boolean;
+    /** Claim with the unit-end rhythm: one approval on the last stage, none per stage. */
+    unitEnd?: boolean;
+    /** Claim with the per-stage rhythm by name, as on a main whose own rhythm is unit-end. */
+    perStage?: boolean;
+    /** The per-Unit stages the candidate documents, reviews and approves; all
+     *  five by default. A stage left out is one the Unit's kind owes nothing. */
+    stages?: string[];
+    /** Runs right after claim, before any stage work or audit receipt is
+     *  written - lets a case mint a real event (e.g. a session-start hook)
+     *  into the fresh checkout's shard before anything else exists there. */
+    afterClaim?: (checkout: string) => void;
+    /** Runs after the Unit's commit, right before publish: what a session
+     *  writes into the checkout between the two. */
+    beforePublish?: (checkout: string) => void;
+    /** Leave the work committed in the checkout and do not publish it. */
+    publish?: boolean;
+    /** Runs once the stage documents and receipts are written, before the
+     *  Unit's work is committed and published: a case drives the engine on
+     *  the worked checkout there (a skip of the step it hands out, say). */
+    beforeCommit?: (checkout: string) => void;
+    /** The run floor every receipt carries, as a clone that read the whole
+     *  audit record (main's rows included) stamps it. The default is the
+     *  floor of a record with no WORKFLOW_STARTED row. */
+    runFloor?: string;
+  } = {},
+): {
+  checkout: string;
+  candidateOid: string;
+  generation: number;
+  auditShard: string;
+} {
+  const checkout = options.checkout ?? clone(remote, label);
+  if (options.crlf) git(checkout, ["config", "core.autocrlf", "false"]);
+  const claim = runMergeTool(
+    UNIT,
+    [
+      "claim", unit, "--team", label,
+      ...(options.unitEnd ? ["--rhythm", "unit-end"] : options.perStage ? ["--rhythm", "per-stage"] : []),
+    ],
+    checkout,
+  );
+  expect(claim.status, claim.out).toBe(0);
+  options.afterClaim?.(checkout);
+  const claimPayload = JSON.parse(claim.stdout);
+  const generation = claimPayload.generation as number;
+  const intentUuid = claimPayload.intent_uuid as string;
+  const stages = options.stages ?? [
+    "functional-design",
+    "nfr-requirements",
+    "nfr-design",
+    "infrastructure-design",
+    "code-generation",
+  ];
+  let state = readFileSync(seededStateFile(checkout), "utf-8");
+  const rowCells = [
+    unit,
+    label,
+    "[x]",
+    "[x]",
+    "[x]",
+    "[x]",
+    "[x]",
+    "[x]",
+  ];
+  if (/^\| unit \|.*\| merged \|$/m.test(state)) rowCells.push("");
+  const row = `| ${rowCells.join(" | ")} |`;
+  state = state.replace(
+    new RegExp(`^\\| ${unit} \\|.*$`, "m"),
+    row,
+  );
+  if (options.mergeHeld) {
+    state = state.replace(
+      "## Project Information",
+      "## Project Information\n- **Merge-Held**: true",
+    );
+  }
+  writeFileSync(seededStateFile(checkout), state);
+
+  const graph = loadStageGraphAll();
+  for (const stageSlug of stages) {
+    const stage = graph.find((entry) => entry.slug === stageSlug)!;
+    // The stage's shared diary, as bootstrapDirectiveMemory writes it at the
+    // stage's start, outside the Unit's folder.
+    const diary = join(seededRecordDir(checkout), "construction", stageSlug, "memory.md");
+    if (!existsSync(diary)) {
+      mkdirSync(dirname(diary), { recursive: true });
+      copyFileSync(join(AIDLC_SRC, "knowledge", "aidlc-shared", "memory-template.md"), diary);
+    }
+    const dir = join(
+      seededRecordDir(checkout),
+      "construction",
+      unit,
+      stageSlug,
+    );
+    mkdirSync(dir, { recursive: true });
+    for (const name of stage.produces ?? []) {
+      const body = `# ${name}\n\ncandidate ${unit}\n`;
+      writeFileSync(
+        join(dir, artifactFilename(name)),
+        options.crlf ? body.replaceAll("\n", "\r\n") : body,
+      );
+    }
+  }
+  const codeDir = join(
+    seededRecordDir(checkout),
+    "construction",
+    unit,
+    "code-generation",
+  );
+  // Its folder too when the stages leave Code Generation out (a case that skips it).
+  mkdirSync(codeDir, { recursive: true });
+  const contract = resolveTestingPosture(checkout, options.earlierContract ? "raw" : undefined);
+  const plan =
+    `# Code Generation Plan\n\n${renderTestingContract(contract)}\n` +
+    "## Steps\n\n- [ ] Implement the Unit.\n";
+  const instructions =
+    "# Unit Test Instructions\n\n## Command\n\n`bun test`\n";
+  const authority = {
+    targetId: `unit:${unit}`,
+    intentId: intentUuid,
+    directiveEpoch: `sha256:${createHash("sha256")
+      .update(`directive:${unit}:${generation}`)
+      .digest("hex")}`,
+    runFloor: options.runFloor ?? "unstarted#0",
+    sourceFloor: `sha256:${createHash("sha256")
+      .update(`source:${unit}:${generation}`)
+      .digest("hex")}`,
+  };
+  const planFingerprint = approvalFingerprint(
+    plan,
+    instructions,
+    contract.contract_sha256,
+    authority,
+  );
+  const questionsFile = join(codeDir, "code-generation-questions.md");
+  const questions =
+    "## Plan Approval\n" +
+    `[Approval Fingerprint]: ${planFingerprint}\n` +
+    `${options.answerLine ?? "[Answer]: A. Approve Plan"}\n`;
+  writeFileSync(join(codeDir, "code-generation-plan.md"), plan);
+  writeFileSync(join(codeDir, "unit-test-instructions.md"), instructions);
+  writeFileSync(questionsFile, questions);
+  const srcDir = join(checkout, "src");
+  mkdirSync(srcDir, { recursive: true });
+  writeFileSync(
+    join(srcDir, `${unit}.ts`),
+    options.sourceText ?? `export const ${unit} = "team";\n`,
+  );
+  if (options.sharedText !== undefined) {
+    writeFileSync(join(srcDir, "shared.ts"), options.sharedText);
+  }
+
+  const floor = options.runFloor ?? "unstarted#0";
+  let audit = "";
+  for (const stage of stages) {
+    const stageNode = graph.find((entry) => entry.slug === stage);
+    const lifecycleExtra = options.wave && stageNode
+      ? `**Mode**: wave\n**Artifact Fingerprint**: ${
+        reviewArtifactFingerprint(
+          checkout,
+          stageNode,
+          unit,
+          { requireRequiredArtifacts: true },
+        )
+      }\n`
+      : "";
+    audit += auditBlock(
+      "UNIT_COMPLETED",
+      unit,
+      generation,
+      stage,
+      lifecycleExtra,
+      floor,
+    );
+    if (stage === "code-generation") {
+      const promptSha256 = createHash("sha256")
+        .update(
+          `${questions
+            .replace(/^\[Answer\]:[ \t]*.*$/gm, "[Answer]:")
+            .trimEnd()}\n`,
+          "utf-8",
+        )
+        .digest("hex");
+      audit += auditBlock(
+        "PLAN_APPROVAL_RECORDED",
+        unit,
+        generation,
+        stage,
+        `**Details**: Approve Plan\n` +
+          `**Checkpoint**: plan-approval\n` +
+          `**Plan Target**: unit:${unit}\n` +
+          `**Intent**: ${intentUuid}\n` +
+          `**Directive Epoch**: ${authority.directiveEpoch}\n` +
+          `**Approval Fingerprint**: ${planFingerprint}\n` +
+          `**Questions File**: ${relative(checkout, questionsFile).replaceAll("\\", "/")}\n` +
+          `**Questions SHA-256**: ${createHash("sha256").update(questions, "utf-8").digest("hex")}\n` +
+          `**Prompt SHA-256**: ${promptSha256}\n` +
+          `**Session**: ${label}-session\n`,
+        floor,
+      );
+    }
+    if (stageNode?.reviewer) {
+      const fingerprint = reviewArtifactFingerprint(
+        checkout,
+        stageNode,
+        unit,
+      );
+      expect(fingerprint).not.toBeNull();
+      const review = reviewAuditExtras(
+        checkout,
+        stage,
+        unit,
+        stageNode.reviewer,
+        fingerprint as string,
+        `${label}:${unit}:${generation}:${stage}`,
+      );
+      audit += auditBlock(
+        "REVIEW_REQUESTED",
+        unit,
+        generation,
+        stage,
+        review.request,
+        floor,
+      );
+      audit += auditBlock(
+        "REVIEW_COMPLETED",
+        unit,
+        generation,
+        stage,
+        review.completion,
+        floor,
+      );
+    }
+    if (options.unitEnd) continue;
+    audit += auditBlock(
+      "GATE_APPROVED",
+      unit,
+      generation,
+      stage,
+      `**Gate Scope**: per-stage\n**Gate Stages**: ${stage}\n**User Input**: Approve\n`,
+      floor,
+    );
+  }
+  const lastStage = stages[stages.length - 1];
+  if (options.unitEnd && lastStage) {
+    audit += auditBlock(
+      "GATE_APPROVED",
+      unit,
+      generation,
+      lastStage,
+      `**Gate Scope**: unit-end\n**Gate Stages**: ${stages.join(", ")}\n**User Input**: Approve\n`,
+      floor,
+    );
+  }
+  const auditShard = auditShardName(checkout);
+  const shardPath = join(seededAuditDir(checkout), auditShard);
+  // afterClaim may have already minted a real event into this shard (e.g. a
+  // session-start hook): keep it rather than clobber it, so a case can put a
+  // real event ahead of these hand-written receipts.
+  const priorShard = existsSync(shardPath) ? readFileSync(shardPath, "utf-8") : "";
+  writeFileSync(shardPath, priorShard + audit);
+  options.beforeCommit?.(checkout);
+  git(checkout, ["add", "-A"]);
+  git(checkout, ["commit", "-m", `complete ${unit}`]);
+  options.beforePublish?.(checkout);
+  if (options.publish === false) return { checkout, candidateOid: "", generation, auditShard };
+  const published = runMergeTool(UNIT, ["publish", unit], checkout);
+  expect(published.status, published.out).toBe(0);
+  return {
+    checkout,
+    candidateOid: JSON.parse(published.stdout).candidate_oid,
+    generation,
+    auditShard,
+  };
+}
+
+export function completeUnitOnMain(projectDir: string, unit: string): void {
+  const stages = [
+    "functional-design",
+    "nfr-requirements",
+    "nfr-design",
+    "infrastructure-design",
+    "code-generation",
+  ];
+  const graph = loadStageGraphAll();
+  for (const stageSlug of stages) {
+    const stage = graph.find((entry) => entry.slug === stageSlug)!;
+    const dir = join(
+      seededRecordDir(projectDir),
+      "construction",
+      unit,
+      stageSlug,
+    );
+    mkdirSync(dir, { recursive: true });
+    for (const name of stage.produces ?? []) {
+      writeFileSync(
+        join(dir, artifactFilename(name)),
+        `# ${name}\n\nmain-built ${unit}\n`,
+      );
+    }
+  }
+  const codeDir = join(
+    seededRecordDir(projectDir),
+    "construction",
+    unit,
+    "code-generation",
+  );
+  const contract = resolveTestingPosture(projectDir);
+  const plan =
+    `# Code Generation Plan\n\n${renderTestingContract(contract)}\n` +
+    "## Steps\n\n- [ ] Implement the Unit on main.\n";
+  const instructions =
+    "# Unit Test Instructions\n\n## Command\n\n`bun test`\n";
+  const planFingerprint = approvalFingerprint(
+    plan,
+    instructions,
+    contract.contract_sha256,
+    {
+      targetId: `unit:${unit}`,
+      intentId: "main-fixture",
+      runFloor: "unstarted#0",
+    },
+  );
+  writeFileSync(join(codeDir, "code-generation-plan.md"), plan);
+  writeFileSync(join(codeDir, "unit-test-instructions.md"), instructions);
+  writeFileSync(
+    join(codeDir, "code-generation-questions.md"),
+    "## Plan Approval\n" +
+      `[Approval Fingerprint]: ${planFingerprint}\n` +
+      "[Answer]: A. Approve Plan\n",
+  );
+  writeFileSync(
+    join(projectDir, "src", `${unit}.ts`),
+    `export const ${unit} = "main";\n`,
+  );
+  let audit = "";
+  for (const stageSlug of stages) {
+    const stage = graph.find((entry) => entry.slug === stageSlug)!;
+    audit += auditBlock("UNIT_COMPLETED", unit, 1, stageSlug);
+    if (stage.reviewer) {
+      const fingerprint = reviewArtifactFingerprint(
+        projectDir,
+        stage,
+        unit,
+      );
+      expect(fingerprint).not.toBeNull();
+      const review = reviewAuditExtras(
+        projectDir,
+        stageSlug,
+        unit,
+        stage.reviewer,
+        fingerprint as string,
+        `main:${unit}:1:${stageSlug}`,
+      );
+      audit += auditBlock(
+        "REVIEW_REQUESTED",
+        unit,
+        1,
+        stageSlug,
+        review.request,
+      );
+      audit += auditBlock(
+        "REVIEW_COMPLETED",
+        unit,
+        1,
+        stageSlug,
+        review.completion,
+      );
+    }
+    audit += auditBlock(
+      "GATE_APPROVED",
+      unit,
+      1,
+      stageSlug,
+      `**Gate Scope**: per-stage\n**Gate Stages**: ${stageSlug}\n**User Input**: Approve\n`,
+    );
+  }
+  writeFileSync(
+    join(seededAuditDir(projectDir), `main-built-${unit}.md`),
+    audit,
+  );
+}
+
+export function appendMainHumanTurn(projectDir: string): void {
+  const shard = join(seededAuditDir(projectDir), auditShardName(projectDir));
+  let existing = "";
+  try {
+    existing = readFileSync(shard, "utf-8");
+  } catch {
+    // A main that has recorded nothing yet has no shard.
+  }
+  writeFileSync(
+    shard,
+    `${existing}## Human Turn
+**Timestamp**: ${
+  new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+}
+**Event**: HUMAN_TURN
+
+---
+`,
+  );
+}
+
+/** The lead's own checkout: this clone made the plan, so its own shard holds
+ *  the plan's approval (Inception's last gate here), and the walk that builds
+ *  Units here is its step, never the board another clone of the work shows
+ *  (planMadeElsewhere). makeSeed's checkout is one already. */
+export function asLeadsOwnCheckout(projectDir: string): void {
+  const shard = join(seededAuditDir(projectDir), auditShardName(projectDir));
+  const existing = existsSync(shard) ? readFileSync(shard, "utf-8") : "";
+  writeFileSync(
+    shard,
+    `${existing}## Gate Approved
+**Timestamp**: 2026-08-19T23:00:00Z
+**Event**: GATE_APPROVED
+**Stage**: units-generation
+**User Input**: Approve
+
+---
+`,
+  );
+}
+
+/** The person's reply to the merge gate the pin showed: a main-shard human
+ *  turn stamped after the pin (both are second-precision), so it is the turn
+ *  the gate counts and the turn that ran the pin is not. */
+export function replyAfterPin(projectDir: string, unit: string): void {
+  const pinnedAt = readUnitMergeTransaction(projectDir, unit)?.pinned_at;
+  expect(pinnedAt).toBeTruthy();
+  while (new Date().toISOString().replace(/\.\d{3}Z$/, "Z") <= pinnedAt!) Bun.sleepSync(50);
+  appendMainHumanTurn(projectDir);
+}
+
+export function approveMerge(
+  main: string,
+  unit: string,
+): { pinnedOid: string; stateBeforeGit: string } {
+  const pin = runMergeTool(UNIT, ["pin", unit], main);
+  expect(pin.status, pin.out).toBe(0);
+  const pinnedOid = JSON.parse(pin.stdout).pinned_oid as string;
+  const gate = runMergeTool(
+    UNIT,
+    [
+      "gate",
+      unit,
+      "--decision",
+      "approve",
+      "--user-input",
+      "Approve pinned candidate",
+    ],
+    main,
+  );
+  expect(gate.status, gate.out).toBe(0);
+  return { pinnedOid, stateBeforeGit: readFileSync(seededStateFile(main), "utf-8") };
+}
+
+export function gateAndLand(
+  main: string,
+  unit: string,
+  stepwise = false,
+): { pinnedOid: string; stateBeforeGit: string } {
+  const { pinnedOid, stateBeforeGit } = approveMerge(main, unit);
+  if (stepwise) {
+    const gitStep = runMergeTool(UNIT, ["land", unit, "--step", "git"], main);
+    expect(gitStep.status, gitStep.out).toBe(0);
+    const firstCommit = JSON.parse(gitStep.stdout).git_commit_oid;
+    expect(readFileSync(seededStateFile(main), "utf-8")).toBe(stateBeforeGit);
+    expect(readFileSync(join(main, "src", `${unit}.ts`), "utf-8")).toContain("team");
+    expect(() => readFileSync(join(main, ".aidlc-unit-claim.json"), "utf-8")).toThrow();
+    const retryGit = runMergeTool(UNIT, ["land", unit, "--step", "git"], main);
+    expect(retryGit.status, retryGit.out).toBe(0);
+    expect(JSON.parse(retryGit.stdout).git_commit_oid).toBe(firstCommit);
+
+    const stateStep = runMergeTool(UNIT, ["land", unit, "--step", "state"], main);
+    expect(stateStep.status, stateStep.out).toBe(0);
+    const folded = readFileSync(seededStateFile(main), "utf-8");
+    const targetCells = unitProgressRow(main, unit)
+      .split("|")
+      .slice(1, -1)
+      .map((cell) => cell.trim());
+    expect(targetCells[0]).toBe(unit);
+    expect(targetCells[1]).not.toBe("-");
+    expect(targetCells.slice(2)).toEqual(
+      targetCells.slice(2).map(() => "[x]"),
+    );
+    expect(folded).toContain("| merged |");
+    const retryState = runMergeTool(UNIT, ["land", unit, "--step", "state"], main);
+    expect(retryState.status, retryState.out).toBe(0);
+    expect(readFileSync(seededStateFile(main), "utf-8")).toBe(folded);
+
+    const auditStep = runMergeTool(UNIT, ["land", unit, "--step", "audit"], main);
+    expect(auditStep.status, auditStep.out).toBe(0);
+    const retryAudit = runMergeTool(UNIT, ["land", unit, "--step", "audit"], main);
+    expect(retryAudit.status, retryAudit.out).toBe(0);
+  } else {
+    const landed = runMergeTool(UNIT, ["land", unit], main);
+    expect(landed.status, landed.out).toBe(0);
+  }
+  return { pinnedOid, stateBeforeGit };
+}
+
+export function nextDirective(projectDir: string): Record<string, unknown> {
+  const first = runMergeTool(ORCH, ["next"], projectDir);
+  expect(first.status, first.out).toBe(0);
+  let directive = JSON.parse(first.stdout) as Record<string, unknown>;
+  while (
+    directive.kind === "load-steering" &&
+    typeof directive.receipt === "string"
+  ) {
+    const continued = runMergeTool(
+      ORCH,
+      ["continue", directive.receipt],
+      projectDir,
+    );
+    expect(continued.status, continued.out).toBe(0);
+    directive = JSON.parse(continued.stdout) as Record<string, unknown>;
+  }
+  return directive;
+}
+
+/** The step after a landing the remote does not have yet is the offer to push
+ *  it (team-handover push); its "Not now" runs `next`, whose step this returns. */
+export function nextPastPushOffer(projectDir: string): Record<string, unknown> {
+  const offer = nextDirective(projectDir);
+  expect(offer, JSON.stringify(offer)).toMatchObject({ kind: "ask", ask_type: "team-handover", handovers: ["push"] });
+  return nextDirective(projectDir);
+}
+
+export function unitProgressRow(projectDir: string, unit: string): string {
+  return readFileSync(seededStateFile(projectDir), "utf-8")
+    .split(/\r?\n/)
+    .find((line) => line.startsWith(`| ${unit} |`)) ?? "";
+}

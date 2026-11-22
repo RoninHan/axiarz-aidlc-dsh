@@ -1,0 +1,603 @@
+// covers: subcommand:aidlc-learnings:surface, subcommand:aidlc-learnings:persist, subcommand:aidlc-graph:compile, function:parseSensorManifest
+//
+// t99 (integration) - section 13 learning-gate END-TO-END.
+//
+// Mechanism: cli. The body SPAWNS the real tools via the Bun runtime against
+// the shipped .ts paths — `aidlc-learnings.ts surface|persist` and
+// `aidlc-graph.ts compile` - against a real dist/claude/.claude COPY + audit
+// shard + memory.md + state + runtime-graph (the surface->glue->persist
+// round-trip). The process boundary IS the subject: exit codes, on-disk audit
+// rows, the learnings-file lines, the two-write sensor bind, and
+// concurrent-write serialisation are all observed through the spawned process
+// + the bytes it leaves on disk. Case 3 ALSO imports parseSensorManifest
+// IN-PROCESS to prove the scaffolded manifest round-trips through the real
+// schema parser - that is the one `function:` unit credited here; everything
+// else is the CLI seam.
+//
+// The conflict-check COMPARISON is the orchestrator-LLM's job (KNOWLEDGE) and
+// never lives in the tool. Case 3b models the verdict by what the test writes
+// into the selections-json (persist receives only conflict-clear /
+// user-escalated selections and never judges) - the section 6-E non-golden
+// reject path actually fires (empty selections -> zero RULE_LEARNED rows), and
+// the escalate path writes through.
+//
+// Source under test:
+//   dist/claude/.claude/tools/aidlc-learnings.ts
+//     surface  - JSON {schema_version, stage_slug, phase,
+//                        memory_entries_total, candidates[], parked_open_questions[],
+//                        questions[]}. A candidate is a correction the agent
+//                        passed with --correction: {id "c<n>", correction,
+//                        default_scope:"project"}; the diary is counted, never offered.
+//     persist  — one withAuditLock body (decide-inside-lock). Appends a
+//                        practice line under the orchestrator-routed heading
+//                        in {project,team}.md (aidlc/spaces/<space>/memory/ via
+//                        memoryDirFor - a learning IS a practice, vision
+//                        section 6; the heading is ensure-exists) keyed by a
+//                        `cid:<intent>:<slug>:<hash>` marker, emits
+//                        RULE_LEARNED. Two-write sensor bind: scaffolds
+//                        .claude/sensors/aidlc-<id>.md + appends the id to the
+//                        origin stage's `sensors:` frontmatter, emits
+//                        SENSOR_PROPOSED with Destinations:
+//                        JSON.stringify([origin_stage]). Idempotent (row+line
+//                        both present -> no-op) + recovery (row present, line
+//                        gone -> re-write only, skip emit).
+//   dist/claude/.claude/tools/aidlc-graph.ts
+//     compile (compileStageGraph) - recompiles stage-graph.json
+//                        (AIDLC_STAGE_GRAPH seam) from stage YAML
+//                        (AIDLC_STAGES_DIR) + sensors (AIDLC_SENSORS_DIR); the
+//                        newly-bound `sensors:` import resolves into the stage
+//                        node's sensors_applicable[].
+//   dist/claude/.claude/tools/aidlc-sensor-schema.ts
+//     parseSensorManifest - extracts {id, matches, ...} from manifest YAML.
+
+import { NATIVE_FIXTURE_SETUP_TIMEOUT_MS } from "../harness/test-budget.ts";
+import { afterAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import {
+  AIDLC_SRC,
+  createTestProject,
+  DEFAULT_RECORD_DIR,
+  DEFAULT_SPACE,
+  FIXTURES_DIR,
+  seededAuditShard,
+  seededRecordDir,
+  seededStateFile,
+  writeLearningsSelections,
+} from "../harness/fixtures.ts";
+import { parseSensorManifest } from "../../dist/claude/.claude/tools/aidlc-sensor-schema.ts";
+import { memoryDirFor } from "../../dist/claude/.claude/tools/aidlc-graph.ts";
+
+// createTestProject seeds the per-intent record (DEFAULT_RECORD_DIR)
+// + active-intent cursor, so the learnings/graph tools resolve THAT record (not
+// the flat aidlc-docs/). State, runtime-graph, the per-stage memory,
+// and the per-clone audit shard all live under it; the runtime-graph memory_path
+// is project-relative so surface's join(projectDir, memRel) finds the file.
+const RP = `aidlc/spaces/${DEFAULT_SPACE}/intents/${DEFAULT_RECORD_DIR}`;
+
+const BUN = process.execPath;
+const TOOLS = join(AIDLC_SRC, "tools");
+const LEARNINGS_TS = join(TOOLS, "aidlc-learnings.ts");
+const GRAPH_TS = join(TOOLS, "aidlc-graph.ts");
+const SEED_GRAPH = join(TOOLS, "data", "stage-graph.json");
+const FIX = join(FIXTURES_DIR, "v05-mr12-learnings");
+const MEMORY_MIXED = join(FIX, "memory-mixed.md");
+
+const projects: string[] = [];
+afterAll(() => {
+  for (const p of projects) rmSync(p, { recursive: true, force: true });
+});
+
+function mkproj(): string {
+  const pd = createTestProject();
+  projects.push(pd);
+  cpSync(AIDLC_SRC, join(pd, ".claude"), { recursive: true });
+  mkdirSync(join(seededRecordDir(pd), "inception", "user-stories"), { recursive: true });
+  writeFileSync(
+    seededStateFile(pd),
+    "# AI-DLC State Tracking\n- **Current Stage**: user-stories\n- **Scope**: feature\n",
+  );
+  writeFileSync(
+    join(seededRecordDir(pd), "runtime-graph.json"),
+    JSON.stringify({
+      workflow_id: "w1",
+      scope: "feature",
+      started_at: "2026-05-28T13:00:00Z",
+      stages: [
+        {
+          stage_slug: "user-stories",
+          memory_path: `${RP}/inception/user-stories/memory.md`,
+        },
+      ],
+    }),
+  );
+  return pd;
+}
+
+function seedMemoryMixed(pd: string): void {
+  cpSync(MEMORY_MIXED, join(seededRecordDir(pd), "inception", "user-stories", "memory.md"));
+}
+
+interface CliResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+function surface(pd: string, slug = "user-stories", ...extra: string[]): CliResult {
+  const r = spawnSync(BUN, [LEARNINGS_TS, "surface", "--slug", slug, ...extra, "--project-dir", pd], {
+    encoding: "utf-8",
+  });
+  return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function persist(pd: string, sel: string, slug = "user-stories", env?: NodeJS.ProcessEnv): CliResult {
+  const r = spawnSync(
+    BUN,
+    [LEARNINGS_TS, "persist", "--slug", slug, "--selections-json", sel, "--project-dir", pd],
+    { encoding: "utf-8", env: env ? { ...process.env, ...env } : process.env },
+  );
+  return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function readAudit(pd: string): string {
+  // persist writes RULE_LEARNED / SENSOR_PROPOSED into the seeded record's
+  // per-clone shard (the fixture pins the clone-id, so the subprocess resolves
+  // the SAME shard as seededAuditShard).
+  const p = seededAuditShard(pd);
+  return existsSync(p) ? readFileSync(p, "utf-8") : "";
+}
+
+function ruleLearnedRows(pd: string): number {
+  return readAudit(pd)
+    .split("\n")
+    .filter((l) => /Event.*: RULE_LEARNED/.test(l)).length;
+}
+
+function countLines(file: string, needle: string): number {
+  if (!existsSync(file)) return 0;
+  return readFileSync(file, "utf-8")
+    .split("\n")
+    .filter((l) => l.includes(needle)).length;
+}
+
+// A confirmed learning is a practice (vision §6): persist appends a practice
+// line into the method file the resolver reads - {project,team}.md
+// under aidlc/spaces/<space>/memory/ (via memoryDirFor()) — not a parallel
+// `*-learnings.md` log.
+function projectPractices(pd: string): string {
+  return join(memoryDirFor(pd), "project.md");
+}
+function teamPractices(pd: string): string {
+  return join(memoryDirFor(pd), "team.md");
+}
+
+const TIMEOUT = NATIVE_FIXTURE_SETUP_TIMEOUT_MS;
+
+describe("t99 §13 learning-gate end-to-end (migrated from t99-learnings-gate-flow.sh, plan 16)", () => {
+  // ===========================================================================
+  // Case 1 — surface mixed → persist project + team learnings + 2 audit rows.
+  // ===========================================================================
+  test("Case 1: surface counts the diary (I/D/T + 1 parked open question) and offers none of it [.sh 1]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const r = surface(pd);
+    expect(r.status).toBe(0);
+    const j = JSON.parse(r.stdout);
+    expect(j.memory_entries_total).toBe(4);
+    expect(j.candidates).toEqual([]);
+    expect(j.questions).toEqual([]);
+    expect(j.parked_open_questions.length).toBe(1);
+    // The fixture memory_path carries the per-intent record dir, so the phase
+    // must be the real one, not a prefix segment like "spaces".
+    expect(j.phase).toBe("inception");
+  }, TIMEOUT);
+
+  test("Case 1: project pick lands as a practice in project.md [.sh 2]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text: "Reused the existing auth module; saved a full rewrite",
+          source: "orchestrator",
+        },
+        {
+          candidate_id: "c2",
+          type: "learning",
+          scope: "team",
+          heading: "Testing Posture",
+          text: "Used Given/When/Then for AC; team standardised",
+          source: "orchestrator",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    expect(readFileSync(projectPractices(pd), "utf-8")).toContain(`cid:${DEFAULT_RECORD_DIR}:user-stories:`);
+  }, TIMEOUT);
+
+  test("Case 1: team-scoped pick lands as a practice in team.md [.sh 3]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text: "Reused the existing auth module; saved a full rewrite",
+          source: "orchestrator",
+        },
+        {
+          candidate_id: "c2",
+          type: "learning",
+          scope: "team",
+          heading: "Testing Posture",
+          text: "Used Given/When/Then for AC; team standardised",
+          source: "orchestrator",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    expect(readFileSync(teamPractices(pd), "utf-8")).toContain(`cid:${DEFAULT_RECORD_DIR}:user-stories:`);
+  }, TIMEOUT);
+
+  test("Case 1: two RULE_LEARNED audit rows [.sh 4]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text: "Reused the existing auth module; saved a full rewrite",
+          source: "orchestrator",
+        },
+        {
+          candidate_id: "c2",
+          type: "learning",
+          scope: "team",
+          heading: "Testing Posture",
+          text: "Used Given/When/Then for AC; team standardised",
+          source: "orchestrator",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    expect(ruleLearnedRows(pd)).toBe(2);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Case 3 — sensor proposal → project-tier manifest + frontmatter bind →
+  // compile binds. Drives the parseSensorManifest in-proc check + a real
+  // `aidlc-graph compile` against the AIDLC_STAGES_DIR / AIDLC_SENSORS_DIR /
+  // AIDLC_STAGE_GRAPH seam.
+  // ===========================================================================
+  function seedSensorProposal(pd: string): string {
+    return writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c5",
+          type: "sensor",
+          origin_stage: "user-stories",
+          manifest_fields: {
+            id: "acceptance-format",
+            kind: "deterministic",
+            command: "bun .claude/tools/aidlc-sensor.ts fire acceptance-format",
+            default_severity: "advisory",
+            description: "Checks AC uses Given/When/Then",
+            matches: "**/aidlc-docs/inception/user-stories/**",
+            timeout_seconds: 30,
+          },
+        },
+      ],
+    });
+  }
+
+  const STAGES_DIR_OF = (pd: string) => join(pd, ".claude", "aidlc-common", "stages");
+  const SENSORS_DIR_OF = (pd: string) => join(pd, ".claude", "sensors");
+
+  test("Case 3: project-tier manifest parses + carries matches glob [.sh 7]", () => {
+    const pd = mkproj();
+    const sel = seedSensorProposal(pd);
+    const r = persist(pd, sel, "user-stories", { AIDLC_STAGES_DIR: STAGES_DIR_OF(pd) });
+    expect(r.status).toBe(0);
+    const manifest = join(SENSORS_DIR_OF(pd), "aidlc-acceptance-format.md");
+    expect(existsSync(manifest)).toBe(true);
+    const m = parseSensorManifest(readFileSync(manifest, "utf-8"));
+    expect(m.id).toBe("acceptance-format");
+    expect(m.matches).toBe("**/aidlc-docs/inception/user-stories/**");
+  }, TIMEOUT);
+
+  test("Case 3: next compile binds the id into user-stories sensors_applicable [.sh 8]", () => {
+    const pd = mkproj();
+    const sel = seedSensorProposal(pd);
+    expect(
+      persist(pd, sel, "user-stories", { AIDLC_STAGES_DIR: STAGES_DIR_OF(pd) }).status,
+    ).toBe(0);
+    // Recompile against the project's stage tree (now carrying the bound
+    // `sensors:` import) + the project's sensors dir, writing to a private graph.
+    const sg = join(pd, "sg.json");
+    cpSync(SEED_GRAPH, sg);
+    const c = spawnSync(BUN, [GRAPH_TS, "compile", "--project-dir", pd], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_STAGES_DIR: STAGES_DIR_OF(pd),
+        AIDLC_SENSORS_DIR: SENSORS_DIR_OF(pd),
+        AIDLC_STAGE_GRAPH: sg,
+      },
+    });
+    expect(c.status).toBe(0);
+    const g = JSON.parse(readFileSync(sg, "utf-8")) as Array<{
+      slug: string;
+      sensors_applicable?: Array<{ id: string }>;
+    }>;
+    const node = g.find((x) => x.slug === "user-stories");
+    expect(node).toBeDefined();
+    const ids = (node?.sensors_applicable ?? []).map((row) => row.id);
+    // Two-write install: the manifest + the frontmatter edit make the id
+    // resolvable on the NEXT compile.
+    expect(ids).toContain("acceptance-format");
+  }, TIMEOUT);
+
+  test("Case 3: SENSOR_PROPOSED row carries Destinations array [user-stories] [.sh 9]", () => {
+    const pd = mkproj();
+    const sel = seedSensorProposal(pd);
+    expect(
+      persist(pd, sel, "user-stories", { AIDLC_STAGES_DIR: STAGES_DIR_OF(pd) }).status,
+    ).toBe(0);
+    const audit = readAudit(pd);
+    const blocks = audit.split(/\n---\n/);
+    const spBlock = blocks.find((b) => /Event.*: SENSOR_PROPOSED/.test(b)) ?? "";
+    expect(spBlock).toContain('Destinations**: ["user-stories"]');
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Case 3b — admission conflict-check (STUBBED verdict). §6-E non-golden: the
+  // reject path actually fires (empty selections → zero writes), then the
+  // escalate path writes the same entry through.
+  // ===========================================================================
+  test("Case 3b: rejected entry never reaches persist — no RULE_LEARNED row [.sh 10]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    // Reject verdict: the conflicting candidate was dropped pre-write → empty.
+    const sel = writeLearningsSelections(pd, { stage_slug: "user-stories", space: DEFAULT_SPACE, intent: DEFAULT_RECORD_DIR, selections: [] });
+    expect(persist(pd, sel).status).toBe(0);
+    // The RULE_LEARNED event (a write) MUST NOT fire: zero RULE_LEARNED rows.
+    expect(ruleLearnedRows(pd)).toBe(0);
+    expect(existsSync(projectPractices(pd))).toBe(false);
+  }, TIMEOUT);
+
+  test("Case 3b: user-escalated entry writes through to the learnings file [.sh 11]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c_escalated",
+          type: "learning",
+          scope: "project",
+          heading: "Testing Posture",
+          text: "This project uses long-lived release branches despite the org trunk-based default",
+          source: "user_addition",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    expect(readFileSync(projectPractices(pd), "utf-8")).toContain(`cid:${DEFAULT_RECORD_DIR}:user-stories:`);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Case 4 — idempotent re-run (same selections-json) → no-op.
+  // ===========================================================================
+  test("Case 4: idempotent re-run → exactly one audit row + one file line [.sh 12]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text: "kept once",
+          source: "orchestrator",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    expect(persist(pd, sel).status).toBe(0);
+    expect(ruleLearnedRows(pd)).toBe(1);
+    expect(countLines(projectPractices(pd), `cid:${DEFAULT_RECORD_DIR}:user-stories:`)).toBe(1);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Case 5 — concurrent persist (same selections-json) → exactly one. The
+  // withAuditLock serialisation is the subject; both spawns race, the lock
+  // sequences them, the cid-marker dedup collapses to one row + one line.
+  // ===========================================================================
+  test("Case 5: concurrent persist serialises → exactly one row + one line [.sh 13]", async () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text: "race-safe write",
+          source: "orchestrator",
+        },
+      ],
+    });
+    // Launch two persists concurrently. Bun.spawn is async, so both processes are
+    // genuinely in flight before either is awaited.
+    const a = Bun.spawn([BUN, LEARNINGS_TS, "persist", "--slug", "user-stories", "--selections-json", sel, "--project-dir", pd], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const b = Bun.spawn([BUN, LEARNINGS_TS, "persist", "--slug", "user-stories", "--selections-json", sel, "--project-dir", pd], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await Promise.all([a.exited, b.exited]);
+    expect(ruleLearnedRows(pd)).toBe(1);
+    expect(countLines(projectPractices(pd), `cid:${DEFAULT_RECORD_DIR}:user-stories:`)).toBe(1);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Case 6 — recovery: audit row present, file line gone → re-write only,
+  // skip re-emit, exit 0.
+  // ===========================================================================
+  test("Case 6: recovery re-writes the line, skips re-emit, exit 0 [.sh 14]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const sel = writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          candidate_id: "c1",
+          type: "learning",
+          scope: "project",
+          heading: "Testing Posture",
+          text: "recover me",
+          source: "orchestrator",
+        },
+      ],
+    });
+    expect(persist(pd, sel).status).toBe(0);
+    // Simulate crash-between-emit-and-write: strip the file line, keep the row.
+    const lf = projectPractices(pd);
+    const stripped = readFileSync(lf, "utf-8")
+      .split("\n")
+      .filter((l) => !l.includes(`cid:${DEFAULT_RECORD_DIR}:user-stories:`))
+      .join("\n");
+    writeFileSync(lf, stripped);
+    const r = persist(pd, sel);
+    expect(r.status).toBe(0);
+    expect(ruleLearnedRows(pd)).toBe(1);
+    expect(countLines(lf, `cid:${DEFAULT_RECORD_DIR}:user-stories:`)).toBe(1);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // Glue — label → candidate_id → selection-record mapping. The surface JSON
+  // must expose {id, correction, default_scope} so two implementers can't
+  // build incompatible question glue.
+  // ===========================================================================
+  const CORRECTION = "keep each story to one screen";
+  const corrected = (pd: string) => JSON.parse(surface(pd, "user-stories", "--correction", CORRECTION).stdout).candidates[0];
+
+  test("Glue: candidate carries {id, correction, default_scope} [.sh 15]", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const c = corrected(pd);
+    expect(c.id).toBe("c1");
+    expect(c.correction).toBe(CORRECTION);
+    expect(c.default_scope).toBe("project");
+  }, TIMEOUT);
+
+  function keyedSelection(pd: string, keys: Record<string, string>, text: string): string {
+    return writeLearningsSelections(pd, {
+      stage_slug: "user-stories",
+      space: DEFAULT_SPACE,
+      intent: DEFAULT_RECORD_DIR,
+      selections: [
+        {
+          ...keys,
+          type: "learning",
+          scope: "project",
+          heading: "Corrections",
+          text,
+          source: "orchestrator",
+        },
+      ],
+    });
+  }
+
+  test("Glue: a selection keyed by surface's own `id` persists", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const candidate = corrected(pd);
+    const sel = keyedSelection(pd, { id: candidate.id }, candidate.correction);
+    const r = persist(pd, sel);
+    expect(r.status, r.stderr).toBe(0);
+    expect(readFileSync(projectPractices(pd), "utf-8")).toContain(candidate.correction);
+    expect(readAudit(pd)).toContain(`**Candidate-ID**: ${candidate.id}`);
+  }, TIMEOUT);
+
+  test("Glue: a selection carrying `candidate_id` and `id` with the same value persists", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const candidate = corrected(pd);
+    const sel = keyedSelection(pd, { candidate_id: candidate.id, id: candidate.id }, candidate.correction);
+    const r = persist(pd, sel);
+    expect(r.status, r.stderr).toBe(0);
+    expect(ruleLearnedRows(pd)).toBe(1);
+    expect(readFileSync(projectPractices(pd), "utf-8")).toContain(candidate.correction);
+  }, TIMEOUT);
+
+  test("Glue: a selection whose `candidate_id` and `id` differ fails, names both, and writes nothing", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const candidate = corrected(pd);
+    const sel = keyedSelection(pd, { candidate_id: candidate.id, id: "c99" }, candidate.correction);
+    const r = persist(pd, sel);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`candidate_id "${candidate.id}" and id "c99"`);
+    expect(ruleLearnedRows(pd)).toBe(0);
+    expect(countLines(projectPractices(pd), candidate.correction)).toBe(0);
+  }, TIMEOUT);
+
+  test("Glue: a selection carrying neither `candidate_id` nor `id` fails and writes nothing", () => {
+    const pd = mkproj();
+    seedMemoryMixed(pd);
+    const candidate = corrected(pd);
+    const sel = keyedSelection(pd, {}, candidate.correction);
+    const r = persist(pd, sel);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("selection missing candidate_id");
+    expect(ruleLearnedRows(pd)).toBe(0);
+    expect(countLines(projectPractices(pd), candidate.correction)).toBe(0);
+  }, TIMEOUT);
+
+});

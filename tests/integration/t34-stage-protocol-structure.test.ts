@@ -1,0 +1,351 @@
+// covers: file:aidlc-common/protocols/stage-protocol.md, file:aidlc-common/protocols/stage-protocol-construction.md, file:knowledge/aidlc-shared/state-template.md
+//
+// A documentation structure + cross-reference check: it reads the SHIPPED
+// stage-protocol.md and state-template.md for the sections, patterns, field
+// names, and agent list the orchestrator relies on, and verifies the two files
+// agree where they reference the same thing (state-tracking field names exist
+// in both the protocol's sed-field guidance AND the state template).
+//
+// MECHANISM = none. gen-coverage-registry derives mechanism from the DRIVERS a
+// test body calls: this test calls NO driver (no driveAidlc, no tui-drive.ts,
+// no spawn of an aidlc-*.ts tool or run-tests.sh), so its derived set is the
+// deterministic `none` floor - matching the t14 / t43 / t44 protocol-content
+// family. Every assertion is readFileSync + a string / regex / count check on
+// the real bytes of the shipped docs.
+//
+// FIXTURE DISCIPLINE: the inputs are the REAL generated shipped files under
+// dist/claude/.claude/, read-only, resolved through AIDLC_SRC from
+// tests/harness/fixtures.ts (fixtures resolves AIDLC_SRC to
+// <repo>/dist/claude/.claude). NOTHING is written; no temp project, no
+// teardown - there is no mutable surface.
+//
+// Source under test (read fresh each run):
+//   dist/claude/.claude/aidlc-common/protocols/stage-protocol.md   (PROTOCOL)
+//   dist/claude/.claude/knowledge/aidlc-shared/state-template.md   (STATE_TEMPLATE)
+//   dist/claude/.claude/aidlc-common/protocols/stage-protocol-construction.md
+//     (CONSTRUCTION_PROTOCOL)
+
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { AIDLC_SRC } from "../harness/fixtures.ts";
+
+const PROTOCOL_PATH = join(
+  AIDLC_SRC,
+  "aidlc-common",
+  "protocols",
+  "stage-protocol.md",
+);
+const STATE_TEMPLATE_PATH = join(
+  AIDLC_SRC,
+  "knowledge",
+  "aidlc-shared",
+  "state-template.md",
+);
+const CONSTRUCTION_PROTOCOL_PATH = join(
+  AIDLC_SRC,
+  "aidlc-common",
+  "protocols",
+  "stage-protocol-construction.md",
+);
+
+const PROTOCOL = readFileSync(PROTOCOL_PATH, "utf-8");
+const STATE_TEMPLATE = readFileSync(STATE_TEMPLATE_PATH, "utf-8");
+const CONSTRUCTION_PROTOCOL = readFileSync(
+  CONSTRUCTION_PROTOCOL_PATH,
+  "utf-8",
+);
+
+function protocolMatches(re: RegExp): boolean {
+  return re.test(PROTOCOL);
+}
+
+function protocolHas(s: string): boolean {
+  return PROTOCOL.includes(s);
+}
+
+describe("t34 stage-protocol.md structure + cross-references (migrated from t34-stage-protocol-structure.sh, plan 69)", () => {
+  // =========================================================================
+  // Section 1 - Required ## sections exist. Anchored `^## N. <Title>` regex
+  // per section (the heading must be a real H2 at line start, not a mid-line
+  // mention).
+  // =========================================================================
+  const REQUIRED_SECTIONS: ReadonlyArray<[number, string]> = [
+    [1, "Approval Gates"],
+    [2, "Completion Messages"],
+    [3, "Question Format"],
+    [4, "State Tracking"],
+    [5, "Agent Persona Loading"],
+    [6, "Error Recovery"],
+    [8, "Depth Guidance"],
+    [9, "Terminology"],
+    [10, "Content Validation"],
+    [12, "Phase Boundary Verification"],
+    [13, "Learnings Ritual"],
+  ];
+  for (const [n, title] of REQUIRED_SECTIONS) {
+    test(`§1: required heading "## ${n}. ${title}" exists`, () => {
+      const re = new RegExp(`^## ${n}\\. ${title}\\b`, "m");
+      expect(protocolMatches(re)).toBe(true);
+    });
+  }
+
+  // =========================================================================
+  // Section 1 - Approval gate patterns.
+  // =========================================================================
+  test("§1: approval gate exempts all 3 initialization stages", () => {
+    expect(protocolHas("workspace-scaffold, workspace-detection, state-init")).toBe(true);
+  });
+
+  // The engine reads no option out of the person's reply, so no rule fixes
+  // how many choices a gate shows or in which order: the agent offers what fits.
+  test("§1: no rule caps or orders the gate's options", () => {
+    expect(protocolHas("NO EMERGENT BEHAVIOR RULE")).toBe(false);
+    expect(protocolHas("Strictly 2-option only")).toBe(false);
+  });
+
+  test("§1: Ideation/Inception may offer approve-and-add for a skipped stage", () => {
+    expect(protocolHas("IDEATION and INCEPTION stages may offer to add a previously skipped stage")).toBe(true);
+    expect(protocolHas("label: Approve, and add [Skipped Stage] next")).toBe(true);
+  });
+
+  test("§1: revision escape hatch is offered from the gate reply, never a count kept in the chat", () => {
+    expect(protocolHas('accept_as_is: "offered"')).toBe(true);
+    expect(protocolHas('accept_as_is: "next-revision"')).toBe(true);
+    expect(protocolHas("Never count the rounds yourself.")).toBe(true);
+  });
+
+  test("§1: escape hatch offers Accept as-is option", () => {
+    expect(protocolHas("Accept as-is")).toBe(true);
+  });
+
+  // =========================================================================
+  // Section 2 - Completion message 5-part structure. Anchored `^### Part`.
+  // =========================================================================
+  const COMPLETION_PARTS: ReadonlyArray<[string, string]> = [
+    ["Part 0", "Enter the approval gate"],
+    ["Part 1", "Announcement"],
+    ["Part 2", "Summary"],
+    ["Part 3", "Review + Approval"],
+    ["Part 4", "Progress update"],
+  ];
+  for (const [part, label] of COMPLETION_PARTS) {
+    test(`§2: completion "### ${part}: ${label}" defined`, () => {
+      // Assert the literal `### Part N: Label` anchored at line start (it IS an H3
+      // heading). Escape regex metacharacters in the label so "Review + Approval"
+      // matches the literal `+` rather than treating it as a quantifier.
+      const escaped = `${part}: ${label}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`^### ${escaped}`, "m");
+      expect(protocolMatches(re)).toBe(true);
+    });
+  }
+
+  // The engine holds the work's depth and test strategy; an agent left to fill
+  // in a level said Standard for Minimal work.
+  test("§2: the first completion message says the levels the run-stage carries, none left to fill in", () => {
+    expect(protocolMatches(/FIRST completion message[^\n]*the levels the run-stage carries as `depth` and `test_strategy`/)).toBe(true);
+    expect(protocolHas("[Minimal/Standard/Comprehensive]")).toBe(false);
+  });
+
+  // =========================================================================
+  // Section 2 - Progress/depth tables list every scope. `| <scope>` is a
+  // markdown table cell opening with the scope name.
+  // =========================================================================
+  const SCOPES = [
+    "enterprise",
+    "feature",
+    "mvp",
+    "poc",
+    "bugfix",
+    "refactor",
+    "infra",
+    "security-patch",
+    "classic",
+    "workshop",
+    "express",
+  ] as const;
+  for (const scope of SCOPES) {
+    test(`§2: depth/progress tables list scope "${scope}"`, () => {
+      expect(protocolHas(`| ${scope}`)).toBe(true);
+    });
+  }
+
+  // =========================================================================
+  // Section 3 - Question format: three interaction modes + mandatory
+  // contradiction detection.
+  // =========================================================================
+  test("§3: question mode 'Guide me' present", () => {
+    expect(protocolHas("Guide me")).toBe(true);
+  });
+
+  test("§3: question mode \"I'll edit the file\" present", () => {
+    expect(protocolHas("I'll edit the file")).toBe(true);
+  });
+
+  test("§3: question mode 'Chat' present", () => {
+    expect(protocolHas("Chat")).toBe(true);
+  });
+
+  test("§3: contradiction detection is MANDATORY (### heading)", () => {
+    expect(protocolHas("### Contradiction detection (MANDATORY)")).toBe(true);
+  });
+
+  test("§3: answered-question reuse reads recursive files and paired audit events", () => {
+    expect(protocolHas("<record>/**/*-questions.md")).toBe(true);
+    // The pairing rules live in `engine log answers` (t350), not in prose that
+    // teaches the conductor the shard format.
+    expect(protocolHas("engine log answers --stage <slug>")).toBe(true);
+    expect(protocolHas("<record>/audit/*.md")).toBe(false);
+    // One reply closes every question logged for the menu it answered; the
+    // follow-up that re-asked an "ambiguous" answer is gone.
+    expect(protocolHas("One reply closes every question logged for the menu it answered")).toBe(true);
+    expect(protocolHas("it is nothing to ask the person about again")).toBe(true);
+    expect(protocolHas("Do not infer an ambiguous answer")).toBe(false);
+  });
+
+  // =========================================================================
+  // Section 4 - State tracking: each sed-referenced field exists in BOTH the
+  // protocol guidance AND the state template. Assert co-presence in one test
+  // per field, so a field present in only one file fails loudly.
+  // =========================================================================
+  const STATE_FIELDS = [
+    "Current Stage",
+    "Lifecycle Phase",
+    "Status",
+    "Last Updated",
+    "Active Agent",
+    "In Progress",
+    "Completed",
+  ] as const;
+  for (const field of STATE_FIELDS) {
+    test(`§4: sed field "${field}" appears as **${field}** in BOTH protocol and state template`, () => {
+      const marker = `**${field}**`;
+      expect(PROTOCOL.includes(marker)).toBe(true);
+      expect(STATE_TEMPLATE.includes(marker)).toBe(true);
+    });
+  }
+
+  // =========================================================================
+  // Section 4 - Stage-progress checkbox notation (`^`-anchored multiline regex).
+  // =========================================================================
+  test("§4: checkbox notation `[ ]` — Not started (anchored)", () => {
+    expect(protocolMatches(/^- `\[ \]` — Not started/m)).toBe(true);
+  });
+
+  test("§4: checkbox notation `[-]` — In progress (anchored)", () => {
+    expect(protocolMatches(/^- `\[-\]` — In progress/m)).toBe(true);
+  });
+
+  test("§4: checkbox notation `[x]` — Completed (anchored)", () => {
+    expect(protocolMatches(/^- `\[x\]` — Completed/m)).toBe(true);
+  });
+
+  // =========================================================================
+  // Section 5 - Agent persona loading: all 11 agents on the agent-list line
+  // (the line starting `aidlc-product-agent`). Assert each agent is on it,
+  // AND assert it carries exactly 11 comma-separated agents - so a dropped or
+  // added agent fails.
+  // =========================================================================
+  const AGENT_LINE =
+    PROTOCOL.split("\n").find((l) => l.startsWith("aidlc-product-agent")) ?? "";
+  const ELEVEN_AGENTS = [
+    "aidlc-product-agent",
+    "aidlc-design-agent",
+    "aidlc-delivery-agent",
+    "aidlc-architect-agent",
+    "aidlc-aws-platform-agent",
+    "aidlc-compliance-agent",
+    "aidlc-devsecops-agent",
+    "aidlc-developer-agent",
+    "aidlc-quality-agent",
+    "aidlc-pipeline-deploy-agent",
+    "aidlc-operations-agent",
+  ] as const;
+  for (const agent of ELEVEN_AGENTS) {
+    test(`§5: protocol agent-list line includes ${agent}`, () => {
+      expect(AGENT_LINE.includes(agent)).toBe(true);
+    });
+  }
+  test("§5: agent-list line names exactly 11 agents (no drop/add)", () => {
+    // Pin the cardinality so the list can't silently grow or shrink while still
+    // containing the 11 names above.
+    const names = AGENT_LINE.split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.startsWith("aidlc-") && s.endsWith("-agent"));
+    expect(names.length).toBe(11);
+  });
+
+  // =========================================================================
+  // Section 5: The lead's persona rides in the step, and the knowledge an inline step
+  // reads comes listed in order on the directive (inline_context_paths), so
+  // the protocol says only to take on the one and keep the order of the other.
+  // =========================================================================
+  test("Section 5: an inline step takes on the lead's persona and reads its knowledge in the order the directive lists it", () => {
+    const text = PROTOCOL.replace(/\s+/g, " ");
+    expect(text).toContain("the step carries the lead's persona itself (`lead_persona`: its file and its text)");
+    expect(text).toContain(
+      "lists what the chat still reads: the supports' personas on an inline stage, then the team's knowledge, then the shipped methodology. Read it in the order listed.",
+    );
+    expect(text).not.toContain("a mob must load its lead persona first");
+    expect(protocolHas("### Knowledge loading order")).toBe(false);
+  });
+
+  // =========================================================================
+  // Section 4 - The audit trail is tool-owned: the guard refuses direct shard
+  // writes, so the section names the owning commands instead of hand-written
+  // entry formats. The exact removed phrases are pinned absent by t349.
+  // =========================================================================
+  test("Section 4: audit trail rules name the tool-owned routes", () => {
+    expect(protocolHas("### Audit trail rules")).toBe(true);
+    // The dist copy under test has {{INVOKE}} expanded, so match the route tail.
+    expect(protocolHas("engine log decision")).toBe(true);
+    expect(protocolHas("engine log answer")).toBe(true);
+    expect(protocolHas("engine audit append-raw")).toBe(true);
+    expect(protocolHas("#### Question interaction log format")).toBe(false);
+  });
+
+  // =========================================================================
+  // Section 8 - Depth-aware question generation + ranges.
+  // =========================================================================
+  test("§8: Depth-aware question generation section exists", () => {
+    expect(protocolHas("Depth-aware question generation")).toBe(true);
+  });
+
+  test("§8: depth guidance includes Minimal range ~2-4", () => {
+    expect(protocolHas("~2-4")).toBe(true);
+  });
+
+  test("§8: depth guidance includes Comprehensive range ~8-12", () => {
+    expect(protocolHas("~8-12")).toBe(true);
+  });
+
+  test("§8: every generated question must be self-explanatory", () => {
+    expect(protocolHas("Questions must be self-explanatory")).toBe(true);
+    expect(protocolHas("Every question MUST stand on its own")).toBe(true);
+    expect(
+      protocolHas("Expand every identifier in each question that uses it"),
+    ).toBe(true);
+  });
+
+  // =========================================================================
+  // Section 8 - Test Strategy section.
+  // =========================================================================
+  test("§8: Test Strategy section exists (### heading)", () => {
+    expect(protocolHas("### Test Strategy")).toBe(true);
+  });
+
+  test("§8: test strategy mentions the Nyquist model", () => {
+    expect(protocolHas("Nyquist")).toBe(true);
+  });
+
+  test("§8: test strategy defines Standard volume (5-8 tests per component)", () => {
+    expect(protocolHas("5-8 tests per component")).toBe(true);
+  });
+
+  // =========================================================================
+  // Section 3: execution modes.
+  // =========================================================================
+  test("§3: the Construction module names the stage files' execution modes", () => {
+    expect(CONSTRUCTION_PROTOCOL).toContain("documents its execution modes (QUESTION-ONLY, ARTIFACT-ONLY, Full)");
+  });
+});

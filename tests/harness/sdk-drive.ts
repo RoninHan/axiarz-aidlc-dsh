@@ -1,0 +1,1752 @@
+// sdk-drive.ts — the SDK harness driver.
+//
+// One reusable module that collapses the three proven spike probes
+// (tools/aidlc-sdk-probe.ts, aidlc-sdk-workflow-probe.ts,
+// aidlc-sdk-toolout-probe.ts) into a single `driveAidlc()` call.
+//
+// This is a MEASURING INSTRUMENT. It will be calibrated by an independent
+// agent in the next stage before any test trusts it. Its job is to run a
+// prompt through the Claude Agent SDK (SDK 0.3.158, Bedrock) and return a
+// fully-structured, deterministic result so tests can assert on tool_result
+// content, written files, and audit/result events — NEVER on the assistant's
+// prose.
+//
+// Verified contract this module encodes (read from the probes + sdk.d.ts):
+//   - query({ prompt, options }) returns an AsyncGenerator<SDKMessage>.
+//     (sdk.d.ts `query`, `SDKMessage` union)
+//   - canUseTool(toolName, input, opts) => Promise<PermissionResult>.
+//     For AskUserQuestion we answer by returning
+//     { behavior: 'allow', updatedInput: { ...input, answers } } where
+//     `answers` maps each question's `question` text -> chosen option label.
+//     (aidlc-sdk-probe.ts, aidlc-sdk-workflow-probe.ts,
+//      sdk.d.ts CanUseTool, PermissionResult)
+//   - assistant text arrives in msg.type === 'assistant', content blocks of
+//     type 'text'. (aidlc-sdk-probe.ts)
+//   - tool_result blocks arrive as a SYNTHETIC msg.type === 'user' message;
+//     ToolResult.content is BYTE-IDENTICAL to the tool's stdout before the
+//     LLM rewords it (the --doctor md5 was stable x3 in the spike).
+//     (aidlc-sdk-toolout-probe.ts, sdk.d.ts SDKUserMessage)
+//   - the terminal event is msg.type === 'result', subtype 'success' or one
+//     of the error subtypes; is_error + permission_denials live there.
+//     (sdk.d.ts SDKResultMessage = SDKResultSuccess | SDKResultError)
+//   - the prompt is sent as a user-message stream that stays open until the
+//     run is done. A plain string prompt is a single-turn query: the SDK
+//     closes the CLI's stdin at the first result, and every later permission
+//     request (an AskUserQuestion included) then fails with "Stream closed".
+//     A turn can end while subagents still run, and the session goes on when
+//     they report, so the stream closes only at a result with no task pending
+//     (task_started without its task_notification), or when the drive ends:
+//     a stop, an abort, or its own timeout. A task that finished while the
+//     turn still ran (task_updated "completed") is reported to the lead inside
+//     that turn and gets no notification, so once every pending task has
+//     finished, a result waits SETTLED_TASK_REPORT_WAIT_MS for one and then
+//     counts as the end of the turn.
+//   - on Windows the CLI is spawned through Options.spawnClaudeCodeProcess
+//     into a kill-on-close Job Object (sdk-process-containment.ts) and the
+//     whole tree is ended after every drive, because the SDK's abort kills
+//     the CLI alone and Windows leaves its in-flight tool children running.
+//
+// Paths the helpers read are the SHIPPED paths from aidlc-lib.ts:
+//   - state:  <projectDir>/aidlc-docs/aidlc-state.md   (aidlc-lib.ts)
+//   - audit:  <projectDir>/aidlc-docs/audit.md         (aidlc-lib.ts)
+
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  createSdkProcessContainment,
+  describeSdkContainment,
+  SDK_NATURAL_EXIT_GRACE_MS,
+} from "./sdk-process-containment.ts";
+import {
+  remainingCleanupTimeoutMs,
+  LIVE_LONG_OPERATION_TIMEOUT_MS,
+  NATIVE_PROCESS_CLEANUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+  TestBudgetExhaustedError,
+} from "./test-budget.ts";
+import { keepAgentWords, keepLegAudit } from "./leg-evidence.ts";
+import { PersonTurnLedger, unbackedFailure } from "./person-turns.ts";
+import type { PermissionRequest } from "./stock-permissions.ts";
+import { recordWindowsFolderHolderVerdict } from "./windows-folder-holders.ts";
+
+const HARNESS_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HARNESS_DIR, "..", "..");
+const SHIPPED_SETTINGS = join(
+  REPO_ROOT,
+  "dist",
+  "claude",
+  ".claude",
+  "settings.json",
+);
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/**
+ * A captured tool call + its verbatim result. `resultText` is byte-identical
+ * to the tool's stdout (verified deterministic in the spike) — assert on THIS,
+ * not on assistantText.
+ */
+export interface CapturedToolResult {
+  /** Tool name as the model invoked it (e.g. "Bash", "Write", "Skill"). */
+  toolName: string;
+  /** The structured tool input the model passed. */
+  input: Record<string, unknown>;
+  /** The toolUseID linking the tool_use to its tool_result. */
+  toolUseId: string;
+  /** Verbatim tool_result content (tool stdout, pre-LLM-rewording). */
+  resultText: string;
+  /** True if the SDK flagged the tool_result as an error. */
+  isError: boolean;
+}
+
+/**
+ * A captured AskUserQuestion menu and the answer the AnswerScript resolved.
+ * Lets tests assert WHICH questions were asked and HOW they were answered,
+ * without screen-scraping.
+ */
+export interface CapturedAskUserQuestion {
+  /** The questions block, structured exactly as the model emitted it. */
+  questions: AskUserQuestionItem[];
+  /** question text -> chosen option label, the value handed back to the SDK. */
+  answers: Record<string, string | string[]>;
+}
+
+/** One question within an AskUserQuestion tool input. */
+export interface AskUserQuestionItem {
+  /** Some menus carry a short header/title; used by the `byHeader` script. */
+  header?: string;
+  question: string;
+  options: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
+/** The SDK's terminal `result` event, captured verbatim. */
+export interface ResultEvent {
+  type: "result";
+  subtype: string;
+  is_error: boolean;
+  num_turns: number;
+  /** Present on success; absent on error subtypes. */
+  result?: string;
+  /** Present on error subtypes; absent on success. */
+  errors?: string[];
+  permissionDenialsCount: number;
+  /** Raw event for callers that need fields this struct doesn't surface. */
+  raw: Record<string, unknown>;
+}
+
+/**
+ * The structured result of one `driveAidlc()` run. Tests assert on
+ * toolResults / stateFile / auditEvents / resultEvent — NOT assistantText.
+ */
+export interface DriveResult {
+  /** Every tool call + its verbatim result, in stream order. */
+  toolResults: CapturedToolResult[];
+  /**
+   * The assistant's concatenated prose. DANGER: this is the LLM's reworded
+   * rendering, non-deterministic. Provided for debugging only — do not assert.
+   */
+  assistantText: string;
+  /**
+   * The assistant's prose up to its first AskUserQuestion call: what the person had read when the question appeared.
+   * The whole prose when it asked nothing. Same DANGER as assistantText; for judging words, never for asserting bytes.
+   */
+  assistantTextBeforeFirstAsk?: string;
+  /** The SDK's terminal result event, or undefined if the stream never ended. */
+  resultEvent: ResultEvent | undefined;
+  /** Contents of aidlc-docs/aidlc-state.md after the run, if it exists. */
+  stateFile?: string;
+  /** Audit event-type strings parsed from aidlc-docs/audit.md, in file order. */
+  auditEvents?: string[];
+  /** Every AskUserQuestion menu seen + how it was answered. */
+  askedQuestions: CapturedAskUserQuestion[];
+  /** True only when the wall-clock timeout aborted the SDK stream. */
+  timedOut: boolean;
+  /** True when an intentional AskUserQuestion boundary aborted the stream. */
+  stoppedAfterAskUserQuestion: boolean;
+  /** True when an intentional matching tool_result boundary aborted the stream. */
+  stoppedAfterToolResult: boolean;
+  /** True when stopWhen ended the drive. */
+  stoppedWhen?: boolean;
+  /** Each finished turn, in order (the last turn is absent when a stop aborted it). */
+  turns?: DriveTurnEnd[];
+  /** Stop hook verdicts, when captureStopHooks was set. */
+  stopHooks?: CapturedStopHook[];
+  /** What each SessionStart hook printed for the session (the SDK always reports it). */
+  sessionStarts?: string[];
+  /** What each UserPromptSubmit hook printed, when capturePromptHooks was set. */
+  promptHooks?: string[];
+  /** What each SubagentStart hook printed (its name is `SubagentStart:<agent>`), when captureSubagentStartHooks was set. */
+  subagentStartHooks?: Array<{ hookName: string; stdout: string }>;
+  /**
+   * Every request Claude Code put to canUseTool other than AskUserQuestion:
+   * what a person on the drive's permission mode and settings would be asked.
+   * Empty under the default bypassPermissions.
+   */
+  permissionRequests?: PermissionRequest[];
+}
+
+// ---------------------------------------------------------------------------
+// AnswerScript — declarative, structure-based question answering.
+//
+// Resolved against the STRUCTURED AskUserQuestion input (questions[].options),
+// never by screen-scraping rendered text. The default person picks by label,
+// never by position (defaultChoice), so a box the agent shows in another
+// order gets the same decision.
+// ---------------------------------------------------------------------------
+
+/** The plain choice a person makes in each kind of menu, first match wins. */
+const PLAIN_CHOICES: RegExp[] = [
+  /^Approve Plans?\b/,
+  /^Guide me\b/i,
+  /^Looks correct\b/i,
+  /^Nothing to add\b/i,
+  /^Approve\b/,
+];
+
+/**
+ * The plain choice at an approval, a mode, a summary or a learnings question;
+ * the shortest of several, so "Approve" wins over "Approve, and add User
+ * Stories next".
+ */
+export function plainChoice(options: string[]): string | undefined {
+  for (const choice of PLAIN_CHOICES) {
+    const hits = options.filter((o) => choice.test(o));
+    if (hits.length > 0) return hits.reduce((a, b) => (b.length < a.length ? b : a));
+  }
+  return undefined;
+}
+
+export function recommended(options: string[]): string | undefined {
+  return options.find((o) => /recommended/i.test(o));
+}
+
+/** What the test person picks when the test names nothing: the plain choice, else the recommended one, else the first. */
+export function defaultChoice(options: string[]): string | undefined {
+  return plainChoice(options) ?? recommended(options) ?? options[0];
+}
+
+/** How a single question's answer is chosen. */
+export type AnswerSpec =
+  /** Pick the option at this 0-based index. */
+  | { optionIndex: number }
+  /** Pick the option whose label === this string exactly. */
+  | { label: string }
+  /** Pick the first option whose label CONTAINS this substring. */
+  | { labelContains: string }
+  /** Multi-select: each entry resolves like a single spec; results combine. */
+  | { multi: Array<{ optionIndex: number } | { label: string } | { labelContains: string }> }
+  /** The person's own words typed into the picker's free-text field. */
+  | { text: string };
+
+/**
+ * A declarative answer policy:
+ *   - 'default': every question takes the default person's pick (defaultChoice).
+ *   - byHeader: map a question's `header` (or `question` text) to a spec;
+ *     questions not matched take the default pick.
+ *   - sequence: answer the Nth AskUserQuestion menu (across the whole run)
+ *     with the Nth spec; menus past the array take the default pick.
+ *   - pick: a function chooses each question's answer as the person would,
+ *     seeing the whole menu (a live journey's person script).
+ *
+ * `sequence` indexes per-MENU (one AskUserQuestion tool call), and within a
+ * menu each question uses the same spec; for fine per-question control inside
+ * a single menu, use `byHeader`.
+ */
+export type AnswerScript =
+  | "default"
+  | { kind: "default" }
+  | { kind: "byHeader"; map: Record<string, AnswerSpec>; fallback?: AnswerSpec }
+  | { kind: "sequence"; specs: AnswerSpec[]; fallback?: AnswerSpec }
+  /** The person decides per question, seeing the whole menu; undefined takes the default pick. */
+  | { kind: "pick"; pick: (question: AskUserQuestionItem, menu: AskUserQuestionItem[], menuIndex: number) => AnswerSpec | undefined };
+
+/**
+ * Resolve one AnswerSpec against a single question's options into the chosen
+ * label (or label[] for multi). No spec, or a spec that can't match, takes
+ * the default pick, so the driver never stalls a run; a calibrator can detect
+ * the fallback by comparing askedQuestions to the script.
+ */
+function resolveSpec(item: AskUserQuestionItem, spec: AnswerSpec | undefined): string | string[] {
+  const labels = item.options.map((o) => o.label);
+  const fallback = defaultChoice(labels) ?? "";
+  const pickIndex = (i: number): string => labels[i] ?? fallback;
+  const pickLabel = (l: string): string => (labels.includes(l) ? l : fallback);
+  const pickContains = (sub: string): string => labels.find((l) => l.includes(sub)) ?? fallback;
+
+  if (spec === undefined) return fallback;
+  if ("optionIndex" in spec) return pickIndex(spec.optionIndex);
+  if ("label" in spec) return pickLabel(spec.label);
+  if ("labelContains" in spec) return pickContains(spec.labelContains);
+  if ("text" in spec) return spec.text;
+  if ("multi" in spec) {
+    return spec.multi.map((s) => {
+      if ("optionIndex" in s) return pickIndex(s.optionIndex);
+      if ("label" in s) return pickLabel(s.label);
+      return pickContains(s.labelContains);
+    });
+  }
+  return fallback;
+}
+
+/**
+ * Given one AskUserQuestion menu (its `questions` array), the script, and the
+ * 0-based index of this menu within the whole run, produce the `answers`
+ * object: question-text -> chosen label (or label[] for multi-select).
+ */
+export function buildAnswers(
+  questions: AskUserQuestionItem[],
+  script: AnswerScript,
+  menuIndex: number,
+): Record<string, string | string[]> {
+  const norm: Exclude<AnswerScript, "default"> =
+    script === "default" ? { kind: "default" } : script;
+
+  const answers: Record<string, string | string[]> = {};
+  for (const q of questions) {
+    let spec: AnswerSpec | undefined;
+    if (norm.kind === "byHeader") {
+      const key = q.header ?? q.question;
+      spec = norm.map[key] ?? norm.map[q.question] ?? norm.fallback;
+    } else if (norm.kind === "sequence") {
+      spec = norm.specs[menuIndex] ?? norm.fallback;
+    } else if (norm.kind === "pick") {
+      spec = norm.pick(q, questions, menuIndex);
+    }
+    answers[q.question] = resolveSpec(q, spec);
+  }
+  return answers;
+}
+
+/**
+ * The option for separate new work in a routing menu, as the agent worded it:
+ * a label leading with "Yes" (the skill's own offer), "separate" in the label
+ * (the engine's "Separate new piece of work"), or, when the agent reworded the
+ * label ("Set up alongside", "Start it alongside", Full Suite 10-08 and 10-10),
+ * the route named in the description it kept for that option. A description
+ * that negates the route ("not a separate piece of work" on another option)
+ * does not count; "do not change the active work" beside the route does. The
+ * options may come in any order. -1 when no option is for separate work.
+ */
+export function separateWorkOptionIndex(options: AskUserQuestionItem["options"]): number {
+  let at = options.findIndex((o) => /^yes\b/i.test(o.label));
+  if (at < 0) at = options.findIndex((o) => /separate/i.test(o.label));
+  if (at < 0) at = options.findIndex((o) => offersSeparateWork(o.description ?? ""));
+  return at;
+}
+
+/** Words that offer separate new work, never words that say it is not separate. */
+export function offersSeparateWork(text: string): boolean {
+  return /\bseparate\b/i.test(text) && !/\bnot (?:a |the )?separate\b/i.test(text);
+}
+
+// ---------------------------------------------------------------------------
+// Drive input: the prompt as a user-message stream held open until close().
+// ---------------------------------------------------------------------------
+
+export interface DriveInput {
+  readonly messages: AsyncIterable<SDKUserMessage>;
+  /** The person's next message in the same session; ignored once closed. */
+  send(text: string): void;
+  close(reason: string): void;
+  readonly closedReason: string | undefined;
+}
+
+export function driveInput(prompt: string): DriveInput {
+  const queued = [prompt];
+  let wake: (() => void) | undefined;
+  let closedReason: string | undefined;
+  const release = (): void => {
+    const resume = wake;
+    wake = undefined;
+    resume?.();
+  };
+  async function* messages(): AsyncGenerator<SDKUserMessage> {
+    for (;;) {
+      while (queued.length > 0) {
+        yield {
+          type: "user",
+          message: { role: "user", content: queued.shift()! },
+          parent_tool_use_id: null,
+        } as SDKUserMessage;
+      }
+      if (closedReason !== undefined) return;
+      await new Promise<void>((resolve) => { wake = resolve; });
+    }
+  }
+  return {
+    messages: messages(),
+    send(text: string) {
+      if (closedReason !== undefined) return;
+      queued.push(text);
+      release();
+    },
+    close(reason: string) {
+      if (closedReason !== undefined) return;
+      closedReason = reason;
+      release();
+    },
+    get closedReason() { return closedReason; },
+  };
+}
+
+/** Claude Code's own result when the person picks a picker's "Chat about
+ *  this" instead of an option: no answer, and the agent
+ *  is told to ask what they want to clarify. */
+export function chatAboutThisResult(questions: AskUserQuestionItem[]): string {
+  return `The user wants to clarify these questions.
+    This means they may have additional information, context or questions for you.
+    Take their response into account and then reformulate the questions if appropriate.
+    Start by asking them what they would like to clarify.
+
+    Questions asked:
+${questions.map((q) => `- "${q.question}"\n  (No answer provided)`).join("\n")}`;
+}
+
+/** How long a result waits for the report of a task the CLI already marked
+ *  finished. A report that resumes the session follows the result within a
+ *  second; one that never comes was handed to the lead inside the turn. */
+export const SETTLED_TASK_REPORT_WAIT_MS = 30_000;
+
+const FINISHED_TASK_STATUSES = new Set(["completed", "failed", "killed"]);
+
+/** The status a task_updated message sets, if it sets one. */
+export function taskUpdateStatus(message: Record<string, unknown>): string | undefined {
+  const patch = message.patch as { status?: unknown } | undefined;
+  return typeof patch?.status === "string" ? patch.status : undefined;
+}
+
+/** Tasks the CLI has started and not yet reported, read from its
+ *  task_started and task_notification messages. Only the notification counts:
+ *  a task_updated "completed" can arrive before the result while the
+ *  notification that resumes the session arrives after it. A task_updated
+ *  that finishes a task also puts it in `settled`: a background task that
+ *  finishes while the turn is still running has its report handed to the lead
+ *  inside that turn, and no notification ever follows. */
+export function trackDriveTask(
+  pending: Set<string>,
+  message: Record<string, unknown>,
+  settled?: Set<string>,
+): void {
+  const taskId = typeof message.task_id === "string" ? message.task_id : undefined;
+  if (taskId === undefined) return;
+  if (message.subtype === "task_started") pending.add(taskId);
+  if (message.subtype === "task_notification") pending.delete(taskId);
+  if (message.subtype === "task_updated" && FINISHED_TASK_STATUSES.has(taskUpdateStatus(message) ?? "")) {
+    settled?.add(taskId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Driver options + main entry point
+// ---------------------------------------------------------------------------
+
+export interface DriveOptions {
+  /** Declarative answer policy for AskUserQuestion gates. Default: 'default'. */
+  answerScript?: AnswerScript;
+  /**
+   * Project directory the SDK runs in. Sets Options.cwd so the SDK picks up
+   * .claude/ + aidlc-docs/ from there (per the workflow probe's cwd note).
+   * Also where the state/audit helpers read from. Default: process.cwd().
+   */
+  projectDir?: string;
+  /**
+   * Wall-clock cap in milliseconds. On timeout the run is aborted via the
+   * SDK AbortController and the partial result is returned with resultEvent
+   * left as whatever (if anything) the stream produced.
+   */
+  timeoutMs?: number;
+  /**
+   * Permission mode. Default 'bypassPermissions' — matches all three spikes,
+   * so non-interactive tools (Bash/Write/Edit/Skill) run without prompts while
+   * canUseTool still fires for AskUserQuestion.
+   */
+  permissionMode?:
+    | "default"
+    | "acceptEdits"
+    | "bypassPermissions"
+    | "plan"
+    | "dontAsk"
+    | "auto";
+  /**
+   * settingSources for the SDK. Default ['project'] so live harness runs load
+   * the copied shipped .claude/settings.json/CLAUDE.md but do not inherit the
+   * developer's user-level hooks or settings (only their model names, when the
+   * run names no model: resolveDriveSdkSettings). Pass [] for SDK isolation, or
+   * opt into ['project','local','user'] from focused calibration tests.
+   * (sdk.d.ts)
+   */
+  settingSources?: Array<"user" | "project" | "local">;
+  /**
+   * Persist the per-drive transcript so hooks can inspect the completed turn.
+   * Required when testing natural Stop-hook completion; defaults to false for
+   * drives that intentionally abort at a tool or question boundary.
+   */
+  persistSession?: boolean;
+  /** Extra env to layer onto the SDK subprocess (e.g. Bedrock overrides). */
+  env?: Record<string, string>;
+  /**
+   * Optional sink for each AskUserQuestion as it is answered — handy when a
+   * calibrator wants a live trace. Receives the same struct stored in
+   * result.askedQuestions.
+   */
+  onAskUserQuestion?: (q: CapturedAskUserQuestion) => void;
+  /**
+   * Calibration/debug escape hatch: return as soon as the first
+   * AskUserQuestion has been captured and answered. This proves the SDK
+   * canUseTool boundary without continuing into whatever live workflow the
+   * chosen answer would normally drive.
+   */
+  stopAfterAskUserQuestion?: boolean;
+  /**
+   * Return after the Nth AskUserQuestion has been answered and its tool_result
+   * has crossed the SDK boundary. One-based; unlike stopAfterAskUserQuestion,
+   * this can skip preparatory/orientation menus.
+   */
+  stopAfterAskUserQuestionAt?: number;
+  /**
+   * Stop after a menu selected from its captured structure and current fixture
+   * evidence. Evaluated before returning its scripted answer; abort waits for
+   * that exact toolUseID's successful tool_result. Preparatory menus continue.
+   * Mutually exclusive with the first/Nth-question stop options.
+   */
+  stopAfterAskUserQuestionWhen?: (menu: CapturedAskUserQuestion) => boolean;
+  /**
+   * Calibration/debug escape hatch: return as soon as a tool_result matching
+   * the requested tool name/text arrives. Useful when the deterministic proof
+   * is the tool output itself and continuing would spend tokens on an unrelated
+   * live workflow.
+   */
+  stopAfterToolResult?: {
+    toolName?: string;
+    resultIncludes: string;
+    inputExcludes?: string;
+  };
+  /**
+   * The person picks the picker's "Chat about this" instead of an option for a
+   * menu this selects: the question stays unanswered (empty `answers`) and the
+   * agent gets Claude Code's own clarify result, so the turn can end with the
+   * question open, as it does for a person who answers in their own message.
+   */
+  chatAboutQuestionWhen?: (menu: CapturedAskUserQuestion) => boolean;
+  /**
+   * The person's next message in the same session. Called when a turn ends (a
+   * result with no task pending) with what that turn did; return the message to
+   * send, or undefined to end the drive. Without it the drive ends at the first
+   * such result, as before.
+   */
+  nextMessage?: (turn: DriveTurnEnd) => string | undefined;
+  /**
+   * After a result, how long to wait for the report of a task the CLI already
+   * marked finished before the turn counts as ended. Default
+   * SETTLED_TASK_REPORT_WAIT_MS; calibration tests shorten it.
+   */
+  settledTaskReportWaitMs?: number;
+  /** Capture every Stop hook verdict into DriveResult.stopHooks. */
+  captureStopHooks?: boolean;
+  /** Capture what every UserPromptSubmit hook printed into DriveResult.promptHooks. */
+  capturePromptHooks?: boolean;
+  /** Capture what every SubagentStart hook printed into DriveResult.subagentStartHooks. */
+  captureSubagentStartHooks?: boolean;
+  /**
+   * End the drive, as a person closing the session would, as soon as this
+   * returns true. Checked after every tool result with the results so far, so
+   * a stop can need several of them (for example a line that may arrive before
+   * or after the step that creates the work).
+   */
+  stopWhen?: (toolResults: readonly CapturedToolResult[]) => boolean;
+}
+
+/** What one turn of a drive left behind, counted from the start of the drive. */
+export interface DriveTurnEnd {
+  /** One-based turn number: 1 is the drive's prompt. */
+  turn: number;
+  askedQuestions: number;
+  toolResults: number;
+  stopHooks: number;
+  /** The assistant's prose so far (a prefix of DriveResult.assistantText): what the person had read when this turn ended. */
+  assistantText: string;
+}
+
+/** One Stop hook run, from the SDK's hook_response event. */
+export interface CapturedStopHook {
+  /** The turn it ended or re-fed (one-based). */
+  turn: number;
+  /** True when its output blocked the stop; `reason` is what the agent got. */
+  blocked: boolean;
+  reason?: string;
+  outcome: string;
+}
+
+interface ClaudeSettings {
+  env?: unknown;
+}
+
+interface DriveSdkSettings {
+  /** The Claude Code the drive starts: the first claude on the drive's own PATH. */
+  executable: string;
+  env: Record<string, string>;
+}
+
+function readClaudeSettings(path: string): ClaudeSettings | undefined {
+  if (!existsSync(path)) return undefined;
+  return JSON.parse(readFileSync(path, "utf8")) as ClaudeSettings;
+}
+
+function stringEnv(settings: ClaudeSettings | undefined): Record<string, string> {
+  if (!settings?.env || typeof settings.env !== "object" || Array.isArray(settings.env)) {
+    return {};
+  }
+
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(settings.env)) {
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
+}
+
+// The suite often runs from inside a Claude Code session, which marks every
+// child process with CLAUDE_CODE_CHILD_SESSION. A Claude started with that
+// marker saves no transcript ("Transcript saving is off"), so the session under
+// test would not be the one a person starts. Every drive and TUI session starts
+// without it.
+export const LAUNCHING_SESSION_MARKERS = ["CLAUDE_CODE_CHILD_SESSION"];
+
+// Claude keeps .claude.json inside an explicit CLAUDE_CONFIG_DIR; without the
+// override it uses the legacy home-level file. Explicit inputs let synthetic
+// checks exercise the Windows preseed without changing the host environment.
+export function preseedClaudeOnboarding(
+  projectDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = homedir(),
+  trustProject = true,
+): void {
+  try {
+    const configDir = env.CLAUDE_CONFIG_DIR || homeDir;
+    mkdirSync(configDir, { recursive: true });
+    const cfgPath = join(configDir, ".claude.json");
+    let cfg: Record<string, unknown> = {};
+    if (existsSync(cfgPath)) {
+      try {
+        cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+      } catch {
+        cfg = {};
+      }
+    }
+    cfg.hasCompletedOnboarding = true;
+    if (trustProject) {
+      const projects =
+        (cfg.projects as Record<string, unknown> | undefined) ?? {};
+      // Forward-slash key: Claude normalises project paths this way.
+      const key = projectDir.replaceAll("\\", "/");
+      if (!(key in projects)) projects[key] = { hasTrustDialogAccepted: true };
+      cfg.projects = projects;
+    }
+    // A freshly created profile file can be briefly refused on Windows (a
+    // scanner or indexer holding it); a lost preseed shows Claude's first-run
+    // chooser instead of the expected startup screens.
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code ?? "";
+        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code) || Date.now() >= deadline) throw error;
+        Bun.sleepSync(20);
+      }
+    }
+  } catch (error) {
+    // Best-effort: a lost preseed shows a TUI session Claude's first-run
+    // screens and leaves an SDK drive's folder untrusted. Say so, because
+    // either is otherwise unexplained.
+    process.stderr.write(`Claude onboarding preseed failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}\n`);
+  }
+}
+
+/** The environment names Claude Code takes a model from. */
+const MODEL_NAME = /^ANTHROPIC_(?:MODEL|DEFAULT_[A-Z]+_MODEL)$/;
+
+function namesAModel(env: Record<string, string>): boolean {
+  return Object.entries(env).some(([key, value]) => MODEL_NAME.test(key) && value.trim() !== "");
+}
+
+/**
+ * The box's own Claude Code settings, the file a person's Claude Code reads,
+ * give only their model names. The drive's child gets them; the
+ * suite's own environment never does. A file Claude Code itself could not read
+ * names nothing here either.
+ */
+function boxModelNames(home: string): Record<string, string> {
+  let settings: ClaudeSettings | undefined;
+  try {
+    settings = readClaudeSettings(join(home, ".claude", "settings.json"));
+  } catch {
+    return {};
+  }
+  return Object.fromEntries(Object.entries(stringEnv(settings)).filter(([key]) => MODEL_NAME.test(key)));
+}
+
+/** Windows keys its environment in any case: a layer's PATH, however spelled, replaces the one before it. */
+function layerEnv(env: Record<string, string>, layer: Record<string, string>): void {
+  for (const [key, value] of Object.entries(layer)) {
+    if (process.platform === "win32" && key.toUpperCase() === "PATH") {
+      for (const old of Object.keys(env)) if (old.toUpperCase() === "PATH") delete env[old];
+    }
+    env[key] = value;
+  }
+}
+
+function pathOf(env: Record<string, string>): string {
+  if (process.platform !== "win32") return env.PATH ?? "";
+  return Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
+}
+
+/**
+ * The Claude Code a person and the TUI legs start: the first claude on PATH.
+ * The Agent SDK spawns it without a shell, so on Windows an npm .cmd or .ps1
+ * shim cannot stand in for claude.exe.
+ */
+function installedClaudeCode(path: string): string {
+  const found = path.trim() === "" ? null : Bun.which("claude", { PATH: path });
+  if (!found) {
+    const name = process.platform === "win32" ? "claude.exe" : "claude";
+    throw new Error(
+      `Live SDK drive stopped before it started: no ${name} on this run's PATH. ` +
+        "Install Claude Code, or put the folder that holds it on PATH, and run again.",
+    );
+  }
+  if (process.platform === "win32" && !/\.exe$/i.test(found)) {
+    throw new Error(
+      `Live SDK drive stopped before it started: the first claude on this run's PATH is ${found}, a shim the Agent ` +
+        "SDK cannot start. Put the folder that holds claude.exe before it on PATH, and run again.",
+    );
+  }
+  return found;
+}
+
+/**
+ * Which Claude Code a drive starts and the environment its child gets. The
+ * drive names no model: the installed Claude Code takes it from the run's
+ * environment (project settings, shipped settings and per-call env layered over
+ * it), else from the box's own Claude Code settings, else runs its own default.
+ * It never updates itself under a drive, whose scratch config carries no
+ * autoUpdates setting.
+ */
+export function resolveDriveSdkSettings(
+  projectDir: string,
+  opts: Pick<DriveOptions, "env"> = {},
+  home: string = homedir(),
+): DriveSdkSettings {
+  const shipped = readClaudeSettings(SHIPPED_SETTINGS);
+  const projectSettingsPath = join(projectDir, ".claude", "settings.json");
+  const project = projectSettingsPath === SHIPPED_SETTINGS
+    ? shipped
+    : readClaudeSettings(projectSettingsPath);
+
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (typeof value === "string") env[key] = value;
+  for (const layer of [stringEnv(project), stringEnv(shipped), opts.env ?? {}]) layerEnv(env, layer);
+  for (const name of LAUNCHING_SESSION_MARKERS) delete env[name];
+  const executable = installedClaudeCode(pathOf(env));
+  // All or nothing: a box name never sits beside a model the run names itself.
+  if (!namesAModel(env)) Object.assign(env, boxModelNames(home));
+  env.DISABLE_AUTOUPDATER = "1";
+  return { executable, env };
+}
+
+function sdkTracePath(): string | undefined {
+  if (process.env.AIDLC_SDK_TRACE_FILE) return process.env.AIDLC_SDK_TRACE_FILE;
+  if (process.env.AIDLC_TEST_DEBUG === "true" && process.env.AIDLC_TEST_LOG_DIR) {
+    return join(process.env.AIDLC_TEST_LOG_DIR, `sdk-drive-${process.pid}.ndjson`);
+  }
+  return undefined;
+}
+
+function writeSdkTrace(
+  tracePath: string | undefined,
+  event: string,
+  data: Record<string, unknown>,
+): void {
+  if (!tracePath) return;
+  mkdirSync(dirname(tracePath), { recursive: true });
+  appendFileSync(tracePath, `${JSON.stringify({ ts: new Date().toISOString(), event, ...data })}\n`);
+}
+
+/**
+ * The tokens the drive's sessions used, per model, from Claude Code's own
+ * transcripts (the nightly's model cost). A drive that ends at a stop condition
+ * gets no result message, and a streamed reply's usage is counted before its
+ * output ends, so the transcript's last usage for each reply is the record.
+ */
+export function transcriptUsage(configDir: string): Record<string, { input: number; cacheRead: number; cacheWrite: number; output: number }> {
+  const replies = new Map<string, { model: string; usage: Record<string, number> }>();
+  const visit = (dir: string): void => {
+    for (const entry of existsSync(dir) ? readdirSync(dir, { withFileTypes: true }) : []) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.name.endsWith(".jsonl")) {
+        for (const line of readFileSync(path, "utf8").split("\n")) {
+          if (!line.includes('"usage"')) continue;
+          try {
+            const message = (JSON.parse(line) as { message?: { id?: string; model?: string; usage?: Record<string, number> } }).message;
+            if (message?.id && message.usage) replies.set(message.id, { model: String(message.model), usage: message.usage });
+          } catch {
+            // A line cut off by the drive's stop is no reply.
+          }
+        }
+      }
+    }
+  };
+  visit(join(configDir, "projects"));
+  const models: Record<string, { input: number; cacheRead: number; cacheWrite: number; output: number }> = {};
+  for (const { model, usage } of replies.values()) {
+    models[model] ??= { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+    const total = models[model];
+    total.input += usage.input_tokens ?? 0;
+    total.cacheRead += usage.cache_read_input_tokens ?? 0;
+    total.cacheWrite += usage.cache_creation_input_tokens ?? 0;
+    total.output += usage.output_tokens ?? 0;
+  }
+  return models;
+}
+
+async function removeEphemeralConfigDir(path: string): Promise<void> {
+  const cleanupDeadline = Date.now() + remainingCleanupTimeoutMs(NATIVE_PROCESS_CLEANUP_TIMEOUT_MS);
+  for (;;) {
+    try { rmSync(path, { recursive: true, force: true }); return; }
+    catch (error) {
+      const remaining = cleanupDeadline - Date.now();
+      if (process.platform !== "win32" || remaining <= 0 ||
+        !["EBUSY", "ENOTEMPTY", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
+    }
+  }
+}
+
+/**
+ * The model service failed under the drive: Claude Code ended the run on an
+ * API error that is the service's (throttled, a server error, the connection
+ * dropped), not one the run caused. The runner reads the name and says the
+ * failure is infrastructure (tests/lib/file-retry.ts modelApiFailed).
+ */
+export class ModelApiError extends Error {
+  override name = "ModelApiError";
+}
+
+// Claude Code's words for a run that ended on the service's API error. A 4xx
+// the request caused (a prompt too long, a bad key, our own abort) is not one.
+const SERVICE_API_ERROR =
+  /^Claude Code returned an error result: API Error: (?:(?:429|5\d\d)\b|The socket connection was closed|Connection error|The system encountered an unexpected error)/;
+
+/** The SDK's failure, as a ModelApiError when it is the model service's. */
+export function driveFailure(error: unknown): unknown {
+  return error instanceof Error && SERVICE_API_ERROR.test(error.message)
+    ? new ModelApiError(error.message, { cause: error })
+    : error;
+}
+
+/**
+ * Drive a single AIDLC prompt through the Claude Agent SDK and return a fully
+ * structured result. This is the one entry point tests use instead of the old
+ * run_claude shell fixture.
+ *
+ * @example
+ *   const r = await driveAidlc("/aidlc --doctor", { projectDir: proj });
+ *   assertResultOk(r);
+ *   assertToolResultContains(r, "Bash", "AI-DLC doctor");
+ *
+ * @example  scripted gates
+ *   const r = await driveAidlc("/aidlc --scope classic Build a todo app", {
+ *     projectDir: proj,
+ *     answerScript: { kind: "sequence", specs: [{ label: "Greenfield" }] },
+ *   });
+ */
+export async function driveAidlc(
+  prompt: string,
+  opts: DriveOptions = {},
+): Promise<DriveResult> {
+  const requestedTimeoutMs = opts.timeoutMs ?? LIVE_LONG_OPERATION_TIMEOUT_MS;
+  const initialTimeoutMs = remainingOperationTimeoutMs(requestedTimeoutMs, { phase: "SDK query" });
+  const deadlineMs = initialTimeoutMs === undefined ? undefined : Date.now() + initialTimeoutMs;
+  const stopAfterAskUserQuestionAt =
+    opts.stopAfterAskUserQuestionAt ??
+    (opts.stopAfterAskUserQuestion ? 1 : undefined);
+  if (opts.stopAfterAskUserQuestionWhen && stopAfterAskUserQuestionAt !== undefined) {
+    throw new Error("Choose either a question predicate or a first/Nth-question stop");
+  }
+  if (
+    stopAfterAskUserQuestionAt !== undefined &&
+    (!Number.isInteger(stopAfterAskUserQuestionAt) || stopAfterAskUserQuestionAt < 1)
+  ) {
+    throw new Error(
+      `stopAfterAskUserQuestionAt must be a positive integer, got ${stopAfterAskUserQuestionAt}`,
+    );
+  }
+  const answerScript: AnswerScript = opts.answerScript ?? "default";
+  const projectDir = opts.projectDir ?? process.cwd();
+  const permissionMode = opts.permissionMode ?? "bypassPermissions";
+  const settingSources = opts.settingSources ?? ["project"];
+  const sdkSettings = resolveDriveSdkSettings(projectDir, opts);
+  // Windows only; undefined elsewhere so the SDK keeps its default spawn.
+  // Created before any per-drive state so a native failure leaves nothing behind.
+  const containment = await createSdkProcessContainment();
+  // settingSources does not relocate Claude's mutable runtime state. Keep live
+  // tests off the user's ~/.claude.json so they work with a read-only home.
+  const requestedConfigDir = opts.env?.CLAUDE_CONFIG_DIR?.trim();
+  const claudeConfigDir =
+    requestedConfigDir ||
+    mkdtempSync(join(process.env.TMPDIR || tmpdir(), "aidlc-sdk-claude-"));
+  const ephemeralConfigDir = requestedConfigDir ? undefined : claudeConfigDir;
+  sdkSettings.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+  // A person runs AI-DLC in a folder whose trust question they answered once; a
+  // drive's fresh config has none, and Claude Code then ignores the project's
+  // allow rules. Claude keys the project by its resolved path.
+  let resolvedProjectDir = projectDir;
+  try {
+    resolvedProjectDir = realpathSync(projectDir);
+  } catch {
+    // A missing folder fails when Claude Code starts in it, inside the drive's cleanup.
+  }
+  for (const dir of new Set([projectDir, resolvedProjectDir])) {
+    preseedClaudeOnboarding(dir, sdkSettings.env, homedir(), true);
+  }
+
+  const toolResults: CapturedToolResult[] = [];
+  const askedQuestions: CapturedAskUserQuestion[] = [];
+  const permissionRequests: PermissionRequest[] = [];
+  const turns: DriveTurnEnd[] = [];
+  const stopHooks: CapturedStopHook[] = [];
+  const sessionStarts: string[] = [];
+  const promptHooks: string[] = [];
+  const subagentStartHooks: Array<{ hookName: string; stdout: string }> = [];
+  // toolUseID -> { toolName, input } so we can join tool_use to its later
+  // synthetic-user tool_result block.
+  const pendingTools = new Map<
+    string,
+    { toolName: string; input: Record<string, unknown> }
+  >();
+  const permissionToolInputs = new Map<string, Record<string, unknown>>();
+  let assistantText = "";
+  let assistantTextBeforeFirstAsk: string | undefined;
+  let resultEvent: ResultEvent | undefined;
+  let askMenuIndex = 0;
+  let turn = 1;
+  let askUserQuestionToolUseIndex = 0;
+  const tracePath = sdkTracePath();
+  // The person's turns: the opening prompt now, each menu answer as it is given.
+  const personTurns = new PersonTurnLedger(projectDir);
+  personTurns.sent(prompt);
+  let stopAfterAskUserQuestionToolUseId: string | undefined;
+  writeSdkTrace(tracePath, "start", {
+    prompt,
+    projectDir,
+    permissionMode,
+    settingSources,
+    persistSession: opts.persistSession ?? false,
+    executable: sdkSettings.executable,
+    timeoutMs: opts.timeoutMs,
+    stopAfterAskUserQuestionAt,
+    stopAfterAskUserQuestionWhen: opts.stopAfterAskUserQuestionWhen !== undefined,
+  });
+
+  const abortController = new AbortController();
+  let timedOut = false;
+  let stoppedAfterAskUserQuestion = false;
+  let stoppedAfterToolResult = false;
+  let stoppedWhen = false;
+  let exhaustedParentBudget: unknown;
+  let containmentFailure: unknown;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const input = driveInput(prompt);
+  const pendingTasks = new Set<string>();
+  const settledTasks = new Set<string>();
+  const closeInput = (reason: string): void => {
+    if (input.closedReason !== undefined) return;
+    writeSdkTrace(tracePath, "input_closed", { reason, pendingTasks: [...pendingTasks] });
+    input.close(reason);
+  };
+  // A turn ended: send the person's next message, or close the input.
+  const endTurn = (closeReason: string): void => {
+    const ended: DriveTurnEnd = {
+      turn,
+      askedQuestions: askedQuestions.length,
+      toolResults: toolResults.length,
+      stopHooks: stopHooks.length,
+      assistantText,
+    };
+    turns.push(ended);
+    const next = resultEvent?.is_error ? undefined : opts.nextMessage?.(ended);
+    if (next === undefined) {
+      closeInput(closeReason);
+    } else {
+      turn++;
+      writeSdkTrace(tracePath, "next_message", { turn, message: next });
+      personTurns.sent(next);
+      input.send(next);
+    }
+  };
+  // A result with tasks still unreported keeps the stream open, as the session
+  // resumes when they report. When every one of them has already finished, its
+  // report either follows the result at once or was handed to the lead inside
+  // the turn and never comes; after a short wait the turn counts as ended.
+  const settledWaitMs = opts.settledTaskReportWaitMs ?? SETTLED_TASK_REPORT_WAIT_MS;
+  let awaitingReports = false;
+  let settledTimer: ReturnType<typeof setTimeout> | undefined;
+  const watchSettledReports = (): void => {
+    const waiting = awaitingReports && input.closedReason === undefined && pendingTasks.size > 0 &&
+      [...pendingTasks].every((taskId) => settledTasks.has(taskId));
+    if (!waiting) {
+      if (settledTimer) clearTimeout(settledTimer);
+      settledTimer = undefined;
+      return;
+    }
+    settledTimer ??= setTimeout(() => {
+      settledTimer = undefined;
+      writeSdkTrace(tracePath, "settled_tasks_unreported", {
+        pendingTasks: [...pendingTasks],
+        waitedMs: settledWaitMs,
+      });
+      pendingTasks.clear();
+      awaitingReports = false;
+      endTurn("result with finished tasks reported inside the turn");
+    }, settledWaitMs);
+  };
+
+  try {
+    const fileAllowance = remainingOperationTimeoutMs(requestedTimeoutMs, { phase: "SDK query" });
+    // Explicit short operation caps still produce the SDK's partial timeout result.
+    // File exhaustion remains a hard shared-budget error.
+    const timeoutMs = deadlineMs === undefined ? fileAllowance : Math.max(1, Math.min(fileAllowance ?? Infinity, deadlineMs - Date.now()));
+    writeSdkTrace(tracePath, "budget", { requestedMs: opts.timeoutMs, timeoutMs });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        writeSdkTrace(tracePath, "timeout", { timeoutMs });
+        try {
+          remainingOperationTimeoutMs(undefined, { phase: "SDK query" });
+        } catch (error) {
+          exhaustedParentBudget = error;
+        }
+        abortController.abort();
+      }, timeoutMs);
+    }
+    const run = query({
+      prompt: input.messages,
+      options: {
+        cwd: projectDir,
+        permissionMode,
+        settingSources,
+        abortController,
+        // Each drive has its own config directory. Natural-completion tests
+        // need the transcript that Stop hooks inspect before accepting a stop.
+        persistSession: opts.persistSession ?? false,
+        // The SDK reports a hook other than SessionStart only when asked.
+        ...(opts.captureStopHooks || opts.capturePromptHooks || opts.captureSubagentStartHooks ? { includeHookEvents: true } : {}),
+        pathToClaudeCodeExecutable: sdkSettings.executable,
+        env: sdkSettings.env,
+        ...(containment
+          ? { spawnClaudeCodeProcess: (spawnOptions) => containment.spawn(spawnOptions) }
+          : {}),
+        canUseTool: async (toolName, input, permissionOptions) => {
+          // PreToolUse rewrites have already run when this callback receives the
+          // input. Retain it as a fallback, but allowed tools can bypass this
+          // callback; Agent/Task tool results carry their executed prompt.
+          permissionToolInputs.set(permissionOptions.toolUseID, input);
+          if (toolName === "AskUserQuestion") {
+            const questions =
+              (input as { questions?: AskUserQuestionItem[] }).questions ?? [];
+            const chat = opts.chatAboutQuestionWhen?.({ questions, answers: {} }) === true;
+            const answers = chat ? {} : buildAnswers(questions, answerScript, askMenuIndex);
+            askMenuIndex++;
+            // "Chat about this" answers nothing: the person's reply comes in
+            // their next message.
+            if (!chat) personTurns.sent(JSON.stringify(answers), Object.keys(answers).length);
+            const captured: CapturedAskUserQuestion = { questions, answers };
+            askedQuestions.push(captured);
+            if (chat) {
+              writeSdkTrace(tracePath, "ask_user_question_chat", {
+                turn,
+                questions: questions.map((q) => q.question),
+              });
+              opts.onAskUserQuestion?.(captured);
+              return { behavior: "deny", message: chatAboutThisResult(questions) };
+            }
+            const predicateSelected = opts.stopAfterAskUserQuestionWhen?.(captured) === true;
+            if (predicateSelected && stopAfterAskUserQuestionToolUseId === undefined) {
+              if (!permissionOptions.toolUseID) {
+                throw new Error("A selected AskUserQuestion must have a toolUseID");
+              }
+              stopAfterAskUserQuestionToolUseId = permissionOptions.toolUseID;
+            }
+            writeSdkTrace(tracePath, "ask_user_question", {
+              questions: questions.map((q) => ({
+                header: q.header,
+                question: q.question,
+                options: q.options.map((o) => o.label),
+              })),
+              answers,
+            });
+            opts.onAskUserQuestion?.(captured);
+            if (predicateSelected || askMenuIndex === stopAfterAskUserQuestionAt) {
+              // Record the INTENT to stop, but do NOT abort here. Aborting inside
+              // canUseTool tears down the SDK permission transport before this
+              // `{ behavior: "allow" }` response can be delivered, so the gate's
+              // tool_result comes back as "Tool permission stream closed before
+              // response received" (isError) instead of carrying the scripted
+              // answer's bytes. The actual stop happens in the tool_result handler
+              // below, keyed on stopAfterAskUserQuestionToolUseId — that fires
+              // AFTER the answer has crossed the boundary and been captured in the
+              // AskUserQuestion tool_result, which is the deterministic surface the
+              // calibration asserts on. (MR10's Windows wave introduced an eager
+              // abort here; the original design stopped only post-tool_result.)
+              writeSdkTrace(tracePath, "will_stop_after_ask_user_question", {
+                menuIndex: askMenuIndex,
+                toolUseId: permissionOptions.toolUseID,
+              });
+            }
+            return {
+              behavior: "allow",
+              updatedInput: { ...(input as object), answers },
+            };
+          }
+          // Everything else passes through unchanged (Bash/Write/Edit/Skill/...),
+          // noted as a prompt a person on these settings would have met.
+          const asked = input as Record<string, unknown>;
+          permissionRequests.push({ toolName, input: asked });
+          writeSdkTrace(tracePath, "permission_request", {
+            toolName, command: asked.command, file_path: asked.file_path ?? asked.notebook_path ?? asked.path,
+          });
+          return { behavior: "allow", updatedInput: input };
+        },
+      },
+    });
+
+    for await (const msg of run) {
+      writeSdkTrace(tracePath, "message", { type: msg.type });
+      // The lead's own messages mean the session resumed; a subagent's do not.
+      if ((msg.type === "assistant" || msg.type === "user") &&
+        !(msg as { parent_tool_use_id?: unknown }).parent_tool_use_id) {
+        awaitingReports = false;
+      }
+      if (msg.type === "system") {
+        const m = msg as Record<string, unknown>;
+        trackDriveTask(pendingTasks, m, settledTasks);
+        // Which Claude Code ran and on which model: the live tier follows the box's install.
+        if (m.subtype === "init") {
+          writeSdkTrace(tracePath, "session", { claudeCodeVersion: m.claude_code_version, model: m.model });
+        }
+        if (m.subtype === "hook_response" && m.hook_event === "SessionStart" && typeof m.stdout === "string") {
+          sessionStarts.push(m.stdout);
+        }
+        if (m.subtype === "hook_response" && m.hook_event === "UserPromptSubmit" && typeof m.stdout === "string") {
+          promptHooks.push(m.stdout);
+        }
+        if (m.subtype === "hook_response" && m.hook_event === "SubagentStart" && typeof m.stdout === "string") {
+          subagentStartHooks.push({ hookName: String(m.hook_name ?? ""), stdout: m.stdout });
+        }
+        if (m.subtype === "hook_response" && m.hook_event === "Stop") {
+          const stop = capturedStopHook(m, turn);
+          stopHooks.push(stop);
+          writeSdkTrace(tracePath, "stop_hook", { ...stop });
+        }
+        if (typeof m.subtype === "string" && m.subtype.startsWith("task_")) {
+          writeSdkTrace(tracePath, "system", {
+            subtype: m.subtype,
+            taskId: typeof m.task_id === "string" ? m.task_id : undefined,
+            status: typeof m.status === "string" ? m.status : taskUpdateStatus(m),
+            pendingTasks: pendingTasks.size,
+          });
+        }
+      } else if (msg.type === "assistant") {
+        // Capture assistant text AND register any tool_use blocks so we can
+        // join them to their tool_result by toolUseID.
+        const content = (msg as { message?: { content?: unknown } }).message
+          ?.content;
+        const lead = !(msg as { parent_tool_use_id?: unknown }).parent_tool_use_id;
+        if (Array.isArray(content)) {
+          for (const block of content as Array<Record<string, unknown>>) {
+            if (block.type === "text" && typeof block.text === "string") {
+              assistantText += block.text;
+              if (lead) keepAgentWords("claude-sdk", [{ turn, text: block.text }]);
+            } else if (
+              block.type === "tool_use" &&
+              typeof block.id === "string"
+            ) {
+              writeSdkTrace(tracePath, "tool_use", {
+                id: block.id,
+                name: typeof block.name === "string" ? block.name : "",
+                input: block.input && typeof block.input === "object" ? block.input : {},
+              });
+              if (
+                block.name === "AskUserQuestion"
+              ) {
+                askUserQuestionToolUseIndex++;
+                assistantTextBeforeFirstAsk ??= assistantText;
+                if (
+                  askUserQuestionToolUseIndex ===
+                    stopAfterAskUserQuestionAt &&
+                  stopAfterAskUserQuestionToolUseId === undefined
+                ) {
+                  stopAfterAskUserQuestionToolUseId = block.id;
+                }
+              }
+              pendingTools.set(block.id, {
+                toolName: typeof block.name === "string" ? block.name : "",
+                input:
+                  block.input && typeof block.input === "object"
+                    ? (block.input as Record<string, unknown>)
+                    : {},
+              });
+            }
+          }
+        }
+      } else if (msg.type === "user") {
+        // tool_result blocks arrive as a synthetic 'user' message. The
+        // content is byte-identical to the tool's stdout (verified in the
+        // toolout spike) before the LLM rewords it. Agent/Task results also
+        // expose the executed prompt after PreToolUse rewrites.
+        const content = (msg as { message?: { content?: unknown } }).message
+          ?.content;
+        const toolUseResult = (msg as { tool_use_result?: unknown })
+          .tool_use_result;
+        if (Array.isArray(content)) {
+          for (const block of content as Array<Record<string, unknown>>) {
+            if (block.type === "tool_result") {
+              const resultText = extractToolResultText(block.content);
+              const toolUseId =
+                typeof block.tool_use_id === "string" ? block.tool_use_id : "";
+              const pending = pendingTools.get(toolUseId);
+              toolResults.push({
+                toolName: pending?.toolName ?? "",
+                input: resolveCapturedToolInput(
+                  pending?.toolName ?? "",
+                  pending?.input ?? {},
+                  permissionToolInputs.get(toolUseId),
+                  toolUseResult,
+                ),
+                toolUseId,
+                resultText,
+                isError: block.is_error === true,
+              });
+              permissionToolInputs.delete(toolUseId);
+              writeSdkTrace(tracePath, "tool_result", {
+                toolUseId,
+                toolName: pending?.toolName ?? "",
+                isError: block.is_error === true,
+                byteLength: resultText.length,
+                preview: resultText.slice(0, 240),
+              });
+              if (
+                toolUseId === stopAfterAskUserQuestionToolUseId
+              ) {
+                if (opts.stopAfterAskUserQuestionWhen && block.is_error === true) {
+                  // A failed permission/result delivery is not a completed
+                  // question boundary. A later matching retry may still stop.
+                  stopAfterAskUserQuestionToolUseId = undefined;
+                  writeSdkTrace(tracePath, "selected_question_result_error", { toolUseId });
+                } else {
+                  stoppedAfterAskUserQuestion = true;
+                  writeSdkTrace(tracePath, "stop_after_ask_user_question", {
+                    toolUseId,
+                  });
+                  abortController.abort();
+                }
+              }
+              if (
+                opts.stopAfterToolResult &&
+                (opts.stopAfterToolResult.toolName === undefined ||
+                  pending?.toolName === opts.stopAfterToolResult.toolName) &&
+                (
+                  opts.stopAfterToolResult.inputExcludes === undefined ||
+                  !JSON.stringify(pending?.input ?? {}).includes(
+                    opts.stopAfterToolResult.inputExcludes,
+                  )
+                ) &&
+                resultText.includes(opts.stopAfterToolResult.resultIncludes)
+              ) {
+                stoppedAfterToolResult = true;
+                writeSdkTrace(tracePath, "stop_after_tool_result", {
+                  toolUseId,
+                  toolName: pending?.toolName ?? "",
+                  matched: opts.stopAfterToolResult.resultIncludes,
+                });
+                abortController.abort();
+              }
+              if (!stoppedWhen && opts.stopWhen?.(toolResults) === true) {
+                stoppedWhen = true;
+                writeSdkTrace(tracePath, "stop_when", { toolUseId, toolName: pending?.toolName ?? "" });
+                abortController.abort();
+              }
+            }
+          }
+        }
+      } else if (msg.type === "result") {
+        const m = msg as Record<string, unknown>;
+        resultEvent = {
+          type: "result",
+          subtype: typeof m.subtype === "string" ? m.subtype : "",
+          is_error: m.is_error === true,
+          num_turns: typeof m.num_turns === "number" ? m.num_turns : 0,
+          result: typeof m.result === "string" ? m.result : undefined,
+          errors: Array.isArray(m.errors) ? (m.errors as string[]) : undefined,
+          permissionDenialsCount: Array.isArray(m.permission_denials)
+            ? (m.permission_denials as unknown[]).length
+            : 0,
+          raw: m,
+        };
+        writeSdkTrace(tracePath, "result", {
+          subtype: resultEvent.subtype,
+          is_error: resultEvent.is_error,
+          num_turns: resultEvent.num_turns,
+          permissionDenialsCount: resultEvent.permissionDenialsCount,
+          pendingTasks: pendingTasks.size,
+        });
+        // With a task still unreported the session resumes when it reports,
+        // so the stream stays open; the drive's own timeout bounds the wait,
+        // except for tasks that already finished (watchSettledReports).
+        if (resultEvent.is_error || pendingTasks.size === 0) {
+          endTurn(resultEvent.is_error ? "error result" : "result with no task pending");
+        } else {
+          awaitingReports = true;
+        }
+      }
+      watchSettledReports();
+    }
+  } catch (err) {
+    // An abort (timeout) surfaces as a thrown error from the generator. Swallow
+    // it only when WE aborted; rethrow genuine SDK failures so they're visible.
+    if (err instanceof TestBudgetExhaustedError) {
+      exhaustedParentBudget = err;
+      writeSdkTrace(tracePath, "error", { message: err.message });
+    } else if (
+      !(
+        (timedOut || stoppedAfterAskUserQuestion || stoppedAfterToolResult || stoppedWhen) &&
+        abortController.signal.aborted
+      )
+    ) {
+      if (timer) clearTimeout(timer);
+      writeSdkTrace(tracePath, "error", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+      throw driveFailure(err);
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (settledTimer) clearTimeout(settledTimer);
+    closeInput(abortController.signal.aborted ? "drive stopped" : "drive ended");
+    if (containment) {
+      // End the CLI's whole tree before touching anything it may hold open.
+      // An aborted drive gets no grace: the CLI is mid-turn and would only
+      // start more tools. A natural completion gets the SDK's own 5 s so the
+      // CLI can finish exiting by itself first.
+      try {
+        const report = await containment.terminate({
+          graceMs: abortController.signal.aborted ? 0 : SDK_NATURAL_EXIT_GRACE_MS,
+        });
+        const verdict = describeSdkContainment(report);
+        writeSdkTrace(tracePath, "containment", { ...report, verdict });
+        recordWindowsFolderHolderVerdict(projectDir, verdict);
+        if (report.survivors.length > 0) {
+          containmentFailure = new Error(`SDK drive left processes running after its Job Object was terminated: ${verdict}`);
+        }
+      } catch (error) {
+        containmentFailure = error;
+        writeSdkTrace(tracePath, "containment_error", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    keepLegAudit(projectDir);
+    if (tracePath) writeSdkTrace(tracePath, "usage", { models: transcriptUsage(claudeConfigDir) });
+    if (ephemeralConfigDir && process.env.AIDLC_KEEP_TEMP !== "1") {
+      await removeEphemeralConfigDir(ephemeralConfigDir);
+    }
+    writeSdkTrace(tracePath, "end", {
+      timedOut,
+      stoppedAfterAskUserQuestion,
+      stoppedAfterToolResult,
+      stoppedWhen,
+      toolResultCount: toolResults.length,
+      askedQuestionCount: askedQuestions.length,
+      hasResultEvent: resultEvent !== undefined,
+    });
+  }
+
+  // Explicit SDK operation timeouts retain their partial-result contract.
+  // Exhausting the shared file pool is a failure, even if partial assertions
+  // could already pass. Unwind and fixture cleanup above still run first.
+  if (exhaustedParentBudget) throw exhaustedParentBudget;
+  // A drive that leaves descendants behind is a failure even when its own
+  // assertions could pass: the next fixture removal would hit them as EBUSY.
+  if (containmentFailure) throw containmentFailure;
+  // So is a decision recorded as the person's that no turn they sent backs.
+  const unbacked = personTurns.unbacked();
+  if (unbacked.length > 0) {
+    writeSdkTrace(tracePath, "unbacked_decision", { decisions: unbacked });
+    throw unbackedFailure("The SDK drive", unbacked);
+  }
+
+  const result: DriveResult = {
+    toolResults,
+    assistantText,
+    assistantTextBeforeFirstAsk: assistantTextBeforeFirstAsk ?? assistantText,
+    resultEvent,
+    askedQuestions,
+    timedOut,
+    stoppedAfterAskUserQuestion,
+    stoppedAfterToolResult,
+    stoppedWhen,
+    turns,
+    stopHooks,
+    sessionStarts,
+    ...(opts.capturePromptHooks ? { promptHooks } : {}),
+    ...(opts.captureSubagentStartHooks ? { subagentStartHooks } : {}),
+    permissionRequests,
+  };
+
+  // Attach post-run file reads when they exist (read straight off disk so the
+  // assertions are deterministic, not paraphrased).
+  const state = readStateFile(projectDir);
+  if (state !== undefined) result.stateFile = state;
+  const audit = readAuditEvents(projectDir);
+  if (audit !== undefined) result.auditEvents = audit;
+
+  return result;
+}
+
+/** A Stop hook's verdict: a block rides its stdout as {"decision":"block"}. */
+export function capturedStopHook(message: Record<string, unknown>, turn: number): CapturedStopHook {
+  const stdout = typeof message.stdout === "string" ? message.stdout.trim() : "";
+  let verdict: { decision?: unknown; reason?: unknown } = {};
+  try { if (stdout) verdict = JSON.parse(stdout) as typeof verdict; } catch { /* not a block */ }
+  const blocked = verdict.decision === "block";
+  return {
+    turn,
+    blocked,
+    ...(blocked && typeof verdict.reason === "string" ? { reason: verdict.reason } : {}),
+    outcome: typeof message.outcome === "string" ? message.outcome : "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// tool_result content extraction (byte-identical to tool stdout).
+//
+// Mirrors aidlc-sdk-toolout-probe.ts: content is either a plain string
+// or an array of { type, text } blocks. We join text blocks in order. No
+// trimming or normalization — the bytes must survive intact.
+// ---------------------------------------------------------------------------
+
+export function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as Array<Record<string, unknown>>)
+      .map((b) => (typeof b.text === "string" ? b.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Resolve the input a tool actually executed. Agent/Task calls allowed by
+ * settings may bypass canUseTool, but their SDK tool result reports the final
+ * prompt after PreToolUse rewrites.
+ */
+export function resolveCapturedToolInput(
+  toolName: string,
+  proposedInput: Record<string, unknown>,
+  permissionInput: Record<string, unknown> | undefined,
+  toolUseResult: unknown,
+): Record<string, unknown> {
+  const input = permissionInput ?? proposedInput;
+  if (
+    toolName !== "Agent" &&
+    toolName !== "Task"
+  ) {
+    return input;
+  }
+  if (
+    !toolUseResult ||
+    typeof toolUseResult !== "object" ||
+    !("prompt" in toolUseResult) ||
+    typeof toolUseResult.prompt !== "string"
+  ) {
+    return input;
+  }
+  return { ...input, prompt: toolUseResult.prompt };
+}
+
+// ---------------------------------------------------------------------------
+// File readers — follow the workspace layout the engine writes.
+//
+// P4 - creation writes per-intent: state lands at
+// aidlc/spaces/<space>/intents/<slug>-<id8>/aidlc-state.md and audit at
+// <record>/audit/<host>-<pid>.md (per-clone shards), NOT the flat aidlc-docs/.
+// These readers resolve the active intent's record from the active-space +
+// active-intent cursors, falling back to the flat layout for a not-yet-created
+// (pre-migration) project so the readers stay correct in both worlds.
+// ---------------------------------------------------------------------------
+
+/** The active intent's record dir, or the flat aidlc-docs/ when none resolves. */
+export function recordDirFor(projectDir: string): string {
+  const spaceCursor = join(projectDir, "aidlc", "active-space");
+  const space = existsSync(spaceCursor)
+    ? readFileSync(spaceCursor, "utf8").trim() || "default"
+    : "default";
+  const intentsDir = join(projectDir, "aidlc", "spaces", space, "intents");
+  const intentCursor = join(intentsDir, "active-intent");
+  if (existsSync(intentCursor)) {
+    const rec = readFileSync(intentCursor, "utf8").trim();
+    if (rec && existsSync(join(intentsDir, rec, "aidlc-state.md"))) {
+      return join(intentsDir, rec);
+    }
+  }
+  return join(projectDir, "aidlc-docs");
+}
+
+/** The SPACE-level domain-knowledge dir: aidlc/spaces/<space>/knowledge —
+ *  a sibling of intents/ (NOT per-intent). The knowledge relocation (b29ced6)
+ *  moved this out of each intent's record so domain knowledge accumulates
+ *  across the whole space; the engine ensures it at creation (aidlc-utility.ts
+ *  ensureWorkspaceDirs → knowledgeDir, lib.ts). Resolves the active space from
+ *  the same cursor recordDirFor reads, defaulting to "default". */
+export function spaceKnowledgeDirFor(projectDir: string): string {
+  const spaceCursor = join(projectDir, "aidlc", "active-space");
+  const space = existsSync(spaceCursor)
+    ? readFileSync(spaceCursor, "utf8").trim() || "default"
+    : "default";
+  return join(projectDir, "aidlc", "spaces", space, "knowledge");
+}
+
+/** Absolute path to the state file the framework writes (per-intent record). */
+export function stateFilePathFor(projectDir: string): string {
+  return join(recordDirFor(projectDir), "aidlc-state.md");
+}
+
+/** Absolute path to the audit SHARD DIR the framework writes (per-clone shards). */
+export function auditDirFor(projectDir: string): string {
+  return join(recordDirFor(projectDir), "audit");
+}
+
+/**
+ * Back-compat single-file audit path for live tests that `readFileSync` the
+ * audit log directly. P4 shards audit per clone under <record>/audit/; a
+ * single-process live test produces exactly ONE shard, so return its path (or
+ * the flat aidlc-docs/audit.md when present — a pre-migration project). Prefer
+ * readAuditEvents()/readAuditText() for multi-shard correctness.
+ */
+export function auditFilePathFor(projectDir: string): string {
+  const dir = auditDirFor(projectDir);
+  if (existsSync(dir)) {
+    const shards = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
+    if (shards.length > 0) return join(dir, shards[0]);
+  }
+  // Pre-migration flat layout, or no shard yet — the flat audit.md path.
+  return join(projectDir, "aidlc-docs", "audit.md");
+}
+
+/** Concatenated text of every audit shard (or "" when none). */
+export function readAuditText(projectDir: string): string {
+  const dir = auditDirFor(projectDir);
+  if (existsSync(dir)) {
+    const shards = readdirSync(dir).filter((f) => f.endsWith(".md"));
+    if (shards.length > 0) {
+      return shards.map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
+    }
+  }
+  const flat = join(projectDir, "aidlc-docs", "audit.md");
+  return existsSync(flat) ? readFileSync(flat, "utf8") : "";
+}
+
+/** Read aidlc-state.md verbatim, or undefined if absent. */
+export function readStateFile(projectDir: string): string | undefined {
+  const p = stateFilePathFor(projectDir);
+  return existsSync(p) ? readFileSync(p, "utf8") : undefined;
+}
+
+/**
+ * Parse the audit log into an ordered list of event-type strings. Each audit
+ * block carries a `**Event**: <TYPE>` line (aidlc-audit.ts); we extract
+ * those across every per-clone shard under <record>/audit/, OR the flat
+ * aidlc-docs/audit.md for a not-yet-created (pre-migration) project. Returns
+ * undefined when no audit exists at all. (P4: audit is sharded per clone, but a
+ * flat legacy/seeded project keeps one audit.md until migration — readAuditText
+ * handles both.)
+ */
+export function readAuditEvents(projectDir: string): string[] | undefined {
+  const text = readAuditText(projectDir);
+  if (text.length === 0) return undefined;
+  const events: string[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\*\*Event\*\*:\s*(\S+)/);
+    if (m) events.push(m[1]);
+  }
+  return events;
+}
+
+/**
+ * Read a single `- **Field**: value` from a state-file string. State files use
+ * the `- **<Field>**: <value>` line shape (see fixtures/state-*.md). Returns the
+ * trimmed value, or undefined if the field is absent. Exported for assert.ts.
+ */
+export function readStateField(
+  stateText: string,
+  field: string,
+): string | undefined {
+  // Escape regex metacharacters in the field name.
+  const esc = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^-\\s*\\*\\*${esc}\\*\\*:\\s*(.*)$`, "m");
+  const m = stateText.match(re);
+  return m ? m[1].trim() : undefined;
+}
+
+/**
+ * Seed the history a copied, already-started SDK state fixture represents.
+ * Uses shipped audit/runtime code against the fixture only; does not build
+ * packages or drive a model. Existing workflow history is never replaced.
+ */
+export async function prepareSdkStageFixture(projectDir: string, stage: string): Promise<void> {
+  const state = readStateFile(projectDir);
+  if (!state || readStateField(state, "Current Stage") !== stage) {
+    throw new Error(`SDK fixture must be positioned at ${stage}`);
+  }
+  const { appendAuditEntry } = await import("../../dist/claude/.claude/tools/aidlc-audit.ts");
+  const { compileRuntime } = await import("../../dist/claude/.claude/tools/aidlc-runtime.ts");
+  const { auditBlockField, findAllEvents, readAllAuditShards, runtimeGraphPath } =
+    await import("../../dist/claude/.claude/tools/aidlc-lib.ts");
+  let audit = readAllAuditShards(projectDir);
+  const completed = [...state.matchAll(/^- \[x\] ([a-z0-9-]+)(?:\s|$)/gm)].map((m) => m[1]);
+  if (findAllEvents(audit, "WORKFLOW_STARTED").length === 0) {
+    appendAuditEntry("WORKFLOW_STARTED", {
+      Scope: readStateField(state, "Scope") ?? "",
+      Request: "Seeded SDK stage fixture",
+    }, projectDir);
+    for (const slug of completed) {
+      appendAuditEntry("STAGE_STARTED", { Stage: slug }, projectDir);
+      appendAuditEntry("STAGE_COMPLETED", { Stage: slug }, projectDir);
+    }
+  }
+  audit = readAllAuditShards(projectDir);
+  const workflow = findAllEvents(audit, "WORKFLOW_STARTED").at(-1)!;
+  const hasAttempt = findAllEvents(audit, "STAGE_STARTED").some((event) =>
+    event.timestamp >= workflow.timestamp &&
+    auditBlockField(event.block, "Stage") === stage &&
+    !auditBlockField(event.block, "Workflow")
+  );
+  if (!hasAttempt) {
+    appendAuditEntry("STAGE_STARTED", {
+      Stage: stage,
+      Agent: readStateField(state, "Active Agent") ?? "",
+    }, projectDir);
+  }
+  const compiled = compileRuntime(projectDir);
+  if (compiled.skipped) throw new Error(`SDK fixture runtime compilation skipped: ${compiled.skipped}`);
+  const graph = JSON.parse(readFileSync(runtimeGraphPath(projectDir), "utf8")) as {
+    workflow_id: string;
+    scope: string;
+    stages: Array<{ stage_slug: string; started_at: string | null; outcome: string }>;
+  };
+  if (
+    graph.workflow_id !== workflow.timestamp ||
+    graph.scope !== readStateField(state, "Scope") ||
+    !graph.stages.some((row) => row.stage_slug === stage && row.started_at && row.outcome === "pending") ||
+    completed.some((slug) => !graph.stages.some((row) =>
+      row.stage_slug === slug && row.outcome === "approved"))
+  ) {
+    throw new Error(`SDK fixture runtime does not represent the seeded history for ${stage}`);
+  }
+}
+
+/**
+ * Bind a main-workflow approval menu to this record, workflow and stage attempt.
+ * English labels are the fixture's stage-protocol vocabulary, in any order and
+ * beside any other choice; arbitrary question prose, blockers and the preceding
+ * learnings menus are not gates.
+ */
+export async function stageApprovalQuestionBoundary(projectDir: string, stage: string) {
+  const {
+    auditBlockField, readAuditShardEvents, maximalAttemptEvents, attemptEventDefinitelyBefore,
+  } = await import("../../dist/claude/.claude/tools/aidlc-lib.ts");
+  type Row = ReturnType<typeof readAuditShardEvents>[number];
+  const identity = (row: Row) => JSON.stringify([row.shard, row.pos, row.timestamp, row.block]);
+  const main = (row: Row) => !auditBlockField(row.block, "Workflow") &&
+    !auditBlockField(row.block, "Unit");
+  const readRows = () => {
+    const unreadable: string[] = [];
+    const rows = readAuditShardEvents(projectDir, undefined, undefined, unreadable);
+    if (unreadable.length) throw new Error("SDK approval evidence has unreadable audit shards");
+    return rows.filter(main);
+  };
+  const floor = (rows: Row[]) => maximalAttemptEvents(rows.filter((row) =>
+    row.event === "WORKFLOW_STARTED" || row.event === "STAGE_JUMPED" ||
+    (auditBlockField(row.block, "Stage") === stage &&
+      ["STAGE_STARTED", "GATE_REJECTED"].includes(row.event))
+  ));
+  const rows = readRows();
+  const workflows = maximalAttemptEvents(rows.filter((row) => row.event === "WORKFLOW_STARTED"));
+  const attempts = floor(rows);
+  if (
+    workflows.length !== 1 || attempts.length !== 1 ||
+    attempts[0].event !== "STAGE_STARTED" ||
+    !attemptEventDefinitelyBefore(workflows[0], attempts[0])
+  ) {
+    throw new Error(`SDK approval requires one coherent workflow/stage attempt for ${stage}`);
+  }
+  const record = recordDirFor(projectDir);
+  const workflow = identity(workflows[0]);
+  const attempt = identity(attempts[0]);
+  return {
+    identity: { record, stage, workflow, attempt },
+    matches(menu: CapturedAskUserQuestion): boolean {
+      const q = menu.questions[0];
+      const labels = q?.options.map((o) => o.label.trim().toLowerCase()) ?? [];
+      if (
+        menu.questions.length !== 1 || q.multiSelect ||
+        q.header?.trim().toLowerCase() !== "approval" ||
+        !labels.includes("approve") || !labels.includes("request changes")
+      ) return false;
+      const state = readStateFile(projectDir);
+      if (
+        !state || recordDirFor(projectDir) !== record ||
+        readStateField(state, "Current Stage") !== stage ||
+        !state.split(/\r?\n/).some((line) =>
+          line.startsWith(`- [?] ${stage}`) &&
+          /^- \[\?\] ([a-z0-9-]+)(?:\s|$)/.exec(line)?.[1] === stage)
+      ) return false;
+      let current: Row[];
+      try { current = readRows(); } catch { return false; }
+      const currentWorkflows = maximalAttemptEvents(current.filter((row) => row.event === "WORKFLOW_STARTED"));
+      const currentFloor = floor(current);
+      if (
+        currentWorkflows.length !== 1 || identity(currentWorkflows[0]) !== workflow ||
+        currentFloor.length !== 1 || identity(currentFloor[0]) !== attempt
+      ) return false;
+      const gates = current.filter((row) =>
+        row.event === "STAGE_AWAITING_APPROVAL" &&
+        auditBlockField(row.block, "Stage") === stage &&
+        auditBlockField(row.block, "Recovered") !== "true" &&
+        attemptEventDefinitelyBefore(currentFloor[0], row)
+      );
+      return gates.some((gate) => !current.some((row) =>
+        auditBlockField(row.block, "Stage") === stage &&
+        ["GATE_APPROVED", "GATE_REJECTED", "STAGE_COMPLETED", "STAGE_SKIPPED", "STAGE_REVISING"].includes(row.event) &&
+        !attemptEventDefinitelyBefore(row, gate)
+      ));
+    },
+  };
+}
