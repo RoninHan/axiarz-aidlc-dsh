@@ -26,6 +26,18 @@ Plan Approval, review classes, the reviewer loop) still govern a run. A later
 milestone wires them through DSH's Cordis hook seams or the
 `dsh-hooks-claude-code` bridge.
 
+## Known gaps (M1)
+
+- **Doctor arm** — `collectDoctorReport` has no `.dsh` arm yet, so `aidlc
+  doctor` on a dsh tree falls back to another tree's file checks (the
+  Claude-shaped `<harness-dir>/settings.json` probe) and can report problems
+  DSH never had. Add a `.dsh` arm before shipping `doctor`.
+- **Tool binding** — `scripts/harness-bindings.ts` has no `dsh` heading, so a
+  dsh tree ships every tool's protocol subsection in the four binding runs
+  (ensemble, construction, reviewer, swarm) until a `### DeepSeek Harness`
+  subsection is added to each and `BINDING_HEADINGS` gains `dsh`.
+- **Hook adapter** — none authored (see the hook gap above).
+
 ## Tier projection
 
 `tierFlavor: "copilot"` — DSH runs every agent on the session's model route
